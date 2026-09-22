@@ -5,9 +5,10 @@
     "label": "Qwen Image 2.1 · ComfyUI",
     "base": "http://127.0.0.1:8899",
     "description": "Create and edit images through an existing local ComfyUI workflow.",
-    "capabilities": ["text_to_image", "image_edit"],
+    "capabilities": ["text_to_image", "image_edit", "transparent_png", "transparent_edit", "subject_extraction", "mask_edit", "annotation_edit"],
     "controls": {
       "max_references": 1,
+      "max_references_by_mode": {"masked": 1},
       "resolutions": [384, 512, 1024, 2048],
       "steps": {"min": 1, "max": 80, "default": 20}
     }

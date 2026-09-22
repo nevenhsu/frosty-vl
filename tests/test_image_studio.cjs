@@ -130,6 +130,23 @@ test('basic Comfy image capabilities disable Qwen-only modes and bound reference
   } finally {close();}
 });
 
+test('Comfy masked mode keeps its separate one-reference allowance',async()=>{
+  const health={ready:true,
+    capabilities:['text_to_image','image_edit','transparent_png','transparent_edit','subject_extraction','mask_edit','annotation_edit'],
+    controls:{max_references:1,max_references_by_mode:{masked:1},resolutions:[384],resolution_default:384,
+      edit_reference_resolution:384,steps:{min:1,max:200,default:20}},
+    dwm:{enabled:false},dwm_default_scale:0,prompt_enhancement:{t2i:false,edit:false}};
+  const {w,close}=await studio({health});
+  try {
+    await w.eval('refreshHealth()');
+    w.document.querySelector('[data-mode="masked"]').click();
+    assert.equal(w.document.querySelector('#reference-count').textContent,'0 / 1');
+    assert.match(w.document.querySelector('#reference-hint').textContent,/1 references \+ 1 mask/);
+    await w.eval('addFiles([{name:"canvas.png"}])');
+    assert.equal(w.document.querySelector('#reference-count').textContent,'1 / 1');
+  } finally {close();}
+});
+
 test('native image controls retain the 1K and 40-step defaults',async()=>{
   const health={ready:true,controls:{max_references:10,resolutions:[512,1024,2048],
     resolution_default:1024,steps:{min:1,max:80,default:40}},

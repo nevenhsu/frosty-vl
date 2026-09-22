@@ -12,9 +12,15 @@ from PIL import Image
 from server import comfy_image_serve as comfy
 
 
-def png_data(color=(40, 80, 120, 255)):
+def png_data(color=(40, 80, 120, 255), size=(16, 12)):
     stream = io.BytesIO()
-    Image.new("RGBA", (16, 12), color).save(stream, format="PNG")
+    Image.new("RGBA", size, color).save(stream, format="PNG")
+    return stream.getvalue()
+
+
+def _png_bytes(image):
+    stream = io.BytesIO()
+    image.save(stream, format="PNG")
     return stream.getvalue()
 
 
@@ -28,6 +34,7 @@ def workflow(include_image=False):
         "negative": {"class_type": "CLIPTextEncode", "inputs": {"text": "template negative"}},
         "seed": {"class_type": "KSampler", "inputs": {"seed": 1, "steps": 30, "cfg": 1.0}},
         "size": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024}},
+        "save": {"class_type": "PreviewImage", "inputs": {"images": ["size", 0]}},
     }
     if include_image:
         nodes["image"] = {"class_type": "LoadImage", "inputs": {"image": "template.png"}}
@@ -47,6 +54,7 @@ def config_mapping(tmp_path, include_image=True):
         "width": {"node_id": "size", "input": "width"},
         "height": {"node_id": "size", "input": "height"},
         "guidance": {"node_id": "seed", "input": "cfg"},
+        "output": {"node_id": "save"},
     }
     edit_fields = dict(fields, references={"node_id": "image", "input": "image"})
     return {
@@ -58,6 +66,26 @@ def config_mapping(tmp_path, include_image=True):
         "poll_interval": 0.001,
         "poll_timeout": 1,
     }
+
+
+def advanced_config_mapping(tmp_path):
+    mapping = config_mapping(tmp_path)
+    masked = tmp_path / "masked.json"
+    masked_nodes = workflow(include_image=True)
+    masked_nodes["mask"] = {"class_type": "LoadImage", "inputs": {"image": "mask.png"}}
+    masked.write_text(json.dumps(masked_nodes), encoding="utf-8")
+    base_bindings = mapping.pop("bindings")
+    mapping["workflows"] = {
+        "t2i": {"path": mapping.pop("t2i_workflow"), "bindings": base_bindings["t2i"]},
+        "edit": {"path": mapping.pop("edit_workflow"), "bindings": base_bindings["edit"]},
+        "masked": {"path": str(masked), "bindings": {
+            **{key: value for key, value in base_bindings["edit"].items() if key != "references"},
+            "reference": {"node_id": "image", "input": "image"},
+            "mask": {"node_id": "mask", "input": "image"},
+        }},
+    }
+    mapping["supported_modes"] = ["transparent", "extract", "masked", "annotate"]
+    return mapping
 
 
 class FakeComfy:
@@ -161,6 +189,128 @@ def test_t2i_workflow_still_requires_dimensions(tmp_path):
 
     with pytest.raises(comfy.ComfyConfigError, match="width"):
         engine.build_workflow(comfy.ImageRequest(prompt="fox"), 1)
+
+
+def test_advanced_mode_request_contract():
+    transparent = comfy.ImageRequest(prompt="glass icon", mode="transparent")
+    assert transparent.mode == "transparent"
+
+    reference = data_url()
+    assert comfy.ImageRequest(prompt="keep the bag", mode="extract", images_b64=[reference]).mode == "extract"
+    assert comfy.ImageRequest(prompt="change the circled label", mode="annotate",
+                               images_b64=[reference]).mode == "annotate"
+    masked = comfy.ImageRequest(prompt="replace the cup", mode="masked", images_b64=[reference],
+                                mask_b64=data_url(png_data((255, 255, 255, 255))))
+    assert masked.preserve_unmasked is True
+
+    with pytest.raises(ValueError, match="reference image"):
+        comfy.ImageRequest(prompt="keep the bag", mode="extract")
+    with pytest.raises(ValueError, match="mask"):
+        comfy.ImageRequest(prompt="replace the cup", mode="masked", images_b64=[reference])
+    with pytest.raises(ValueError, match="only in masked"):
+        comfy.ImageRequest(prompt="new", mask_b64=data_url())
+
+
+def test_config_accepts_opt_in_advanced_modes_and_mask_binding(tmp_path):
+    config = comfy.ComfyConfig.from_mapping(advanced_config_mapping(tmp_path), tmp_path / "config.json")
+
+    assert set(config.workflows) == {"t2i", "edit", "masked"}
+    assert config.supported_modes == frozenset({"transparent", "extract", "masked", "annotate"})
+
+
+def test_advanced_modes_route_and_inject_effective_prompts(tmp_path):
+    config = comfy.ComfyConfig.from_mapping(advanced_config_mapping(tmp_path), tmp_path / "config.json")
+    engine = comfy.ComfyImageEngine(config, FakeComfy())
+    reference = data_url()
+
+    transparent = engine.build_workflow(comfy.ImageRequest(prompt="glass icon", mode="transparent"), 1)
+    assert "RGBA image with transparency" in transparent["prompt"]["inputs"]["text"]
+    transparent_edit = engine.build_workflow(
+        comfy.ImageRequest(prompt="keep the shape", mode="transparent", images_b64=[reference]), 2,
+        ["input/original.png"])
+    assert transparent_edit["image"]["inputs"]["image"] == "input/original.png"
+
+    extracted = engine.build_workflow(
+        comfy.ImageRequest(prompt="the red bag", mode="extract", images_b64=[reference]), 3,
+        ["input/original.png"])
+    assert extracted["prompt"]["inputs"]["text"].startswith("Extract the requested subject")
+
+    annotated = engine.build_workflow(
+        comfy.ImageRequest(prompt="change this label", mode="annotate", images_b64=[reference]), 4,
+        ["input/annotated.png"])
+    assert "Remove the annotation markings" in annotated["prompt"]["inputs"]["text"]
+
+    masked = engine.build_workflow(
+        comfy.ImageRequest(prompt="replace the cup", mode="masked", images_b64=[reference],
+                           mask_b64=data_url(png_data((255, 255, 255, 255)))),
+        5, ["input/original.png"], "input/mask.png")
+    assert masked["image"]["inputs"]["image"] == "input/original.png"
+    assert masked["mask"]["inputs"]["image"] == "input/mask.png"
+    assert "region marked white" in masked["prompt"]["inputs"]["text"]
+
+
+def test_masked_job_uploads_mask_separately_and_validates_pixels(tmp_path):
+    config = comfy.ComfyConfig.from_mapping(advanced_config_mapping(tmp_path), tmp_path / "config.json")
+    fake = FakeComfy()
+    engine = comfy.ComfyImageEngine(config, fake)
+    reference = data_url(png_data((10, 20, 30, 255)))
+    mask = data_url(png_data((255, 255, 255, 255)))
+
+    job = engine.submit(comfy.ImageRequest(prompt="replace", mode="masked", seed=9,
+                                           images_b64=[reference], mask_b64=mask))
+    run_job(engine, job["id"])
+
+    assert [name for _, name in fake.uploads] == [
+        f"frosty_{job['id']}_00.png", f"frosty_{job['id']}_mask.png"]
+    assert fake.prompts[0]["image"]["inputs"]["image"] == "input/uploaded-1.png"
+    assert fake.prompts[0]["mask"]["inputs"]["image"] == "input/uploaded-2.png"
+
+    with pytest.raises(ValueError, match="mask is empty"):
+        comfy.ImageRequest(prompt="replace", mode="masked", images_b64=[reference],
+                           mask_b64=data_url(png_data((0, 0, 0, 255))))
+    with pytest.raises(ValueError, match="same dimensions"):
+        comfy.ImageRequest(prompt="replace", mode="masked", images_b64=[reference],
+                           mask_b64=data_url(png_data((255, 255, 255, 255), (8, 8))))
+
+
+def test_selected_workflow_filters_outputs_and_mask_preserves_unselected_pixels(tmp_path):
+    config = comfy.ComfyConfig.from_mapping(advanced_config_mapping(tmp_path), tmp_path / "config.json")
+    fake = FakeComfy()
+    engine = comfy.ComfyImageEngine(config, fake)
+
+    transparent_spec = comfy.ImageRequest(prompt="icon", mode="transparent", seed=1)
+    transparent_job = engine.submit(transparent_spec)
+    engine._publish_outputs(transparent_job["id"], transparent_spec, 1, "transparent-prompt", {
+        "noise": {"images": [{"filename": "ignore.png"}]},
+        "save": {"images": [{"filename": "keep.png"}]},
+    }, 0)
+    assert [name for name, _, _ in fake.views] == ["keep.png"]
+
+    original = Image.new("RGBA", (4, 2), (0, 0, 255, 255))
+    mask = Image.new("RGBA", (4, 2), (0, 0, 0, 255))
+    for x in range(2):
+        for y in range(2):
+            mask.putpixel((x, y), (255, 255, 255, 255))
+    # Match the bundled workflow's behavior: Comfy may render a smaller fixed
+    # canvas than the uploaded source.  The final composite must retain the
+    # source dimensions and untouched source pixels outside the mask.
+    generated = png_data((255, 0, 0, 128), (2, 1))
+    fake.view = lambda *_: generated
+    spec = comfy.ImageRequest(prompt="replace", mode="masked", seed=2,
+                              images_b64=[data_url(_png_bytes(original))],
+                              mask_b64=data_url(_png_bytes(mask)), preserve_unmasked=True)
+    job = engine.submit(spec)
+    engine._publish_outputs(job["id"], spec, 2, "masked-prompt",
+                            {"save": {"images": [{"filename": "masked.png"}]}}, 0)
+
+    output_name = engine.get(job["id"])["outputs"][0]["name"]
+    with Image.open(engine.output / output_name) as result:
+        assert result.size == original.size
+        assert result.convert("RGBA").getpixel((0, 0)) == (255, 0, 0, 128)
+        assert result.convert("RGBA").getpixel((3, 0)) == (0, 0, 255, 255)
+    item = next(entry for entry in engine.library.gallery()["items"] if entry["name"] == output_name)
+    assert item["effective_prompt"].startswith("Edit the first image in the region marked white")
+    assert item["preserve_unmasked"] is True
 
 
 def test_workflow_is_deep_copied_and_typed_fields_injected(configured):
@@ -358,3 +508,23 @@ def test_api_health_and_gallery_basics(configured, monkeypatch):
     token = trash["results"][0]["trash_id"]
     assert client.post("/gallery/restore", json={"ids": [token]}).json()["ok"] is True
     assert client.get("/files/saved.png").status_code == 200
+
+
+def test_health_advertises_only_configured_advanced_modes(tmp_path, monkeypatch):
+    basic = comfy.ComfyImageEngine(
+        comfy.ComfyConfig.from_mapping(config_mapping(tmp_path), tmp_path / "basic.json"), FakeComfy())
+    monkeypatch.setattr(comfy, "engine", basic)
+    basic_health = TestClient(comfy.app).get("/health").json()
+    assert not ({"transparent_png", "subject_extraction", "mask_edit", "annotation_edit"}
+                & set(basic_health["capabilities"]))
+    basic_response = TestClient(comfy.app).post("/jobs", json={"prompt": "icon", "mode": "transparent"})
+    assert basic_response.status_code == 422
+    assert "not enabled" in basic_response.json()["detail"]
+
+    advanced = comfy.ComfyImageEngine(
+        comfy.ComfyConfig.from_mapping(advanced_config_mapping(tmp_path), tmp_path / "advanced.json"), FakeComfy())
+    monkeypatch.setattr(comfy, "engine", advanced)
+    health = TestClient(comfy.app).get("/health").json()
+    assert {"transparent_png", "transparent_edit", "subject_extraction", "mask_edit", "annotation_edit"} \
+        <= set(health["capabilities"])
+    assert health["controls"]["max_references_by_mode"]["masked"] == 1

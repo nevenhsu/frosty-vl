@@ -1,6 +1,7 @@
 {
   "comfyui_url": "http://127.0.0.1:8188",
   "output_dir": "../../ComfyUI/output/Qwen21",
+  "supported_modes": ["transparent", "extract", "masked", "annotate"],
   "workflows": {
     "t2i": {
       "path": "../workflows/qwen21_t2i_api.json",
@@ -24,6 +25,19 @@
         "steps": ["458", "steps"],
         "guidance": ["458", "cfg"],
         "reference": ["460", "image"],
+        "output": "461"
+      }
+    },
+    "masked": {
+      "path": "../workflows/qwen21_masked_api.json",
+      "bindings": {
+        "prompt": ["474", "prompt"],
+        "negative_prompt": ["474", "negative_prompt"],
+        "seed": ["458", "seed"],
+        "steps": ["458", "steps"],
+        "guidance": ["458", "cfg"],
+        "reference": ["460", "image"],
+        "mask": ["475", "image"],
         "output": "461"
       }
     }

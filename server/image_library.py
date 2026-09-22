@@ -63,7 +63,7 @@ class ImageLibrary:
     trash_name = ".frosty-trash"
     file_prefix = "/api/images/files/"
     metadata_fields = ("prompt", "effective_prompt", "seed", "mode", "width", "height",
-                       "num_inference_steps", "dwm_scale", "reference_count")
+                       "num_inference_steps", "dwm_scale", "reference_count", "preserve_unmasked")
 
     def _name(self, name):
         return _name(name, self.media_types)

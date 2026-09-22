@@ -40,7 +40,7 @@ from .image_library import ImageLibrary, TYPES
 MAX_BODY = 36_000_000
 MAX_REFERENCES = 10
 MAX_REFERENCE_BYTES = 12_000_000
-CAPABILITIES = ["text_to_image", "image_edit", "multi_reference"]
+ADVANCED_MODES = frozenset({"transparent", "extract", "masked", "annotate"})
 _MISSING = object()
 
 
@@ -118,7 +118,7 @@ def _normalise_bindings(raw: Any, workflow: Mapping[str, Any], label: str) -> di
     aliases = {"num_inference_steps": "steps", "guidance_scale": "guidance",
                "true_cfg_scale": "guidance", "ref": "references", "reference_images": "references"}
     known = {"prompt", "negative_prompt", "seed", "steps", "width", "height", "guidance",
-             "reference", "references", "image", "images", "output", *aliases}
+             "reference", "references", "image", "images", "mask", "output", *aliases}
     result: dict[str, list[tuple[str, str]]] = {}
     for field, value in raw.items():
         field = aliases.get(field, field)
@@ -152,6 +152,7 @@ class ComfyConfig:
     comfyui_url: str
     output_dir: Path
     workflows: dict[str, WorkflowSpec]
+    supported_modes: frozenset[str] = frozenset()
     request_timeout: float = 30.0
     poll_interval: float = 0.25
     poll_timeout: float = 86_400.0
@@ -172,7 +173,7 @@ class ComfyConfig:
             nested = raw.get("workflow_paths")
         if isinstance(nested, Mapping):
             workflow_paths.update(nested)
-        for mode in ("t2i", "edit"):
+        for mode in ("t2i", "edit", "masked"):
             value = _first(raw, f"{mode}_workflow", f"{mode}_workflow_path",
                            f"{mode}_api_workflow", f"{mode}_api_workflow_path", f"{mode}_api_path", default=None)
             if value is not None:
@@ -181,13 +182,15 @@ class ComfyConfig:
         if not isinstance(bindings_root, Mapping):
             bindings_root = {}
         workflows: dict[str, WorkflowSpec] = {}
-        for mode in ("t2i", "edit"):
+        for mode in ("t2i", "edit", "masked"):
             path_value = workflow_paths.get(mode)
             if isinstance(path_value, Mapping):
                 workflow_path = _first(path_value, "path", "workflow", "file")
                 inline_workflow = path_value.get("template")
             else:
                 workflow_path, inline_workflow = path_value, None
+            if workflow_path is None and inline_workflow is None and mode == "masked":
+                continue
             if workflow_path is None and inline_workflow is None:
                 raise ComfyConfigError(f"Missing {mode} workflow path")
             if inline_workflow is not None:
@@ -211,15 +214,26 @@ class ComfyConfig:
             if mode_bindings is None and isinstance(workflow_paths.get(mode), Mapping):
                 mode_bindings = workflow_paths[mode].get("bindings")
             bindings = _normalise_bindings(mode_bindings, template, f"{mode} workflow")
-            if mode == "edit" and not any(bindings.get(key) for key in ("references", "reference", "images", "image")):
-                raise ComfyConfigError("edit workflow must bind at least one reference image explicitly")
+            if mode in {"edit", "masked"} and not any(bindings.get(key) for key in ("references", "reference", "images", "image")):
+                raise ComfyConfigError(f"{mode} workflow must bind at least one reference image explicitly")
+            if mode == "masked" and not bindings.get("mask"):
+                raise ComfyConfigError("masked workflow must bind a mask image explicitly")
             workflows[mode] = WorkflowSpec(resolved, copy.deepcopy(dict(template)), bindings)
+        supported_modes_raw = raw.get("supported_modes") or []
+        if not isinstance(supported_modes_raw, list) or not all(isinstance(item, str) for item in supported_modes_raw):
+            raise ComfyConfigError("supported_modes must be a list of mode names")
+        supported_modes = frozenset(item.strip().lower() for item in supported_modes_raw)
+        unknown_modes = supported_modes - ADVANCED_MODES
+        if unknown_modes:
+            raise ComfyConfigError("Unsupported configured modes: " + ", ".join(sorted(unknown_modes)))
+        if "masked" in supported_modes and "masked" not in workflows:
+            raise ComfyConfigError("masked mode requires a masked workflow")
         timeout = float(raw.get("request_timeout", 30.0))
         poll_interval = float(raw.get("poll_interval", 0.25))
         poll_timeout = float(raw.get("poll_timeout", 86_400.0))
         if timeout <= 0 or poll_interval <= 0 or poll_timeout <= 0:
             raise ComfyConfigError("ComfyUI timeouts must be positive")
-        return cls(url.rstrip("/"), output_dir, workflows, timeout, poll_interval, poll_timeout)
+        return cls(url.rstrip("/"), output_dir, workflows, supported_modes, timeout, poll_interval, poll_timeout)
 
 
 def load_config(path: str | os.PathLike[str] | None = None) -> ComfyConfig | None:
@@ -340,6 +354,8 @@ class ImageRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=12000)
     mode: str = "auto"
     images_b64: list[str] = Field(default_factory=list, max_length=MAX_REFERENCES)
+    mask_b64: str | None = None
+    preserve_unmasked: bool = True
     negative_prompt: str = Field(default="", max_length=4000)
     seed: int | None = Field(default=None, ge=0, le=2**63 - 1)
     steps: int = Field(default=30, alias="num_inference_steps", ge=1, le=200)
@@ -352,18 +368,26 @@ class ImageRequest(BaseModel):
     def validate_request(self):
         self.prompt = self.prompt.strip()
         self.mode = self.mode.strip().lower()
-        if self.mode not in {"auto", "generate", "edit"}:
-            raise ValueError("ComfyUI supports only auto, generate, and edit modes")
+        if self.mode not in {"auto", "generate", "edit", "transparent", "extract", "masked", "annotate"}:
+            raise ValueError("Unsupported image mode")
         if self.mode == "auto":
             self.mode = "edit" if self.images_b64 else "generate"
         if self.mode == "generate" and self.images_b64:
             raise ValueError("generate mode does not accept reference images; use edit")
-        if self.mode == "edit" and not self.images_b64:
-            raise ValueError("edit mode requires at least one reference image")
+        if self.mode in {"edit", "extract", "masked", "annotate"} and not self.images_b64:
+            raise ValueError("This mode requires at least one reference image")
+        if self.mode == "masked" and not self.mask_b64:
+            raise ValueError("masked mode requires a mask")
+        if self.mask_b64 and self.mode != "masked":
+            raise ValueError("Masks are accepted only in masked mode")
+        if self.mask_b64 and len(self.images_b64) > MAX_REFERENCES - 1:
+            raise ValueError(f"Use up to {MAX_REFERENCES - 1} references plus one mask")
         if self.width % 8 or self.height % 8:
             raise ValueError("Width and height must be multiples of 8")
-        if sum(len(item) for item in self.images_b64) > MAX_REFERENCES * MAX_REFERENCE_BYTES * 2:
+        if sum(len(item) for item in self.images_b64) + len(self.mask_b64 or "") > MAX_REFERENCES * MAX_REFERENCE_BYTES * 2:
             raise ValueError("Combined reference images are too large")
+        if self.mode == "masked":
+            _decode_mask(self.mask_b64, self.images_b64[0])
         return self
 
 
@@ -396,6 +420,22 @@ def _decode_reference(value: str) -> tuple[bytes, str]:
     return data, "reference.png"
 
 
+def _decode_mask(value: str, reference_value: str) -> bytes:
+    reference_data, _ = _decode_reference(reference_value)
+    mask_data, _ = _decode_reference(value)
+    with Image.open(io.BytesIO(reference_data)) as source:
+        reference_size = source.size
+    with Image.open(io.BytesIO(mask_data)) as source:
+        if source.size != reference_size:
+            raise ValueError("The mask must have the same dimensions as the first reference")
+        mask = source.convert("L")
+    if mask.getextrema()[1] == 0:
+        raise ValueError("The mask is empty; paint the area to edit in white")
+    normalized = io.BytesIO()
+    mask.save(normalized, format="PNG")
+    return normalized.getvalue()
+
+
 def _queue_ids(value: Any) -> set[str]:
     ids: set[str] = set()
     if isinstance(value, str):
@@ -410,6 +450,32 @@ def _queue_ids(value: Any) -> set[str]:
         for item in value:
             ids.update(_queue_ids(item))
     return ids
+
+
+def _workflow_key(spec: ImageRequest) -> str:
+    if spec.mode == "generate":
+        return "t2i"
+    if spec.mode in {"edit", "extract", "annotate"}:
+        return "edit"
+    if spec.mode == "transparent":
+        return "edit" if spec.images_b64 else "t2i"
+    return spec.mode
+
+
+def _effective_prompt(spec: ImageRequest) -> str:
+    if spec.mode == "transparent":
+        return ("This is an RGBA image with transparency. " + spec.prompt +
+                ". The image has alpha channel and the background is transparent.")
+    if spec.mode == "extract":
+        return ("Extract the requested subject from the first image as an RGBA image with a transparent "
+                "background. Preserve the subject's appearance. " + spec.prompt)
+    if spec.mode == "masked":
+        return ("Edit the first image in the region marked white in the last image (the black-and-white edit "
+                "mask). Preserve the other regions and remove any mask markings from the result. " + spec.prompt)
+    if spec.mode == "annotate":
+        return ("Follow the editing annotations on the first reference image. Remove the annotation markings "
+                "in the finished image. " + spec.prompt)
+    return spec.prompt
 
 
 class ComfyImageEngine:
@@ -489,6 +555,8 @@ class ComfyImageEngine:
             spec = ImageRequest.model_validate(spec)
         if not self.ready:
             raise HTTPException(503, self.error or "ComfyUI image adapter is not configured")
+        if spec.mode in ADVANCED_MODES and spec.mode not in self.config.supported_modes:
+            raise ComfyConfigError(f"Mode {spec.mode} is not enabled by this ComfyUI configuration")
         with self.lock:
             if self.pending.full():
                 raise HTTPException(429, "The image queue is full; wait for a render to finish")
@@ -562,8 +630,8 @@ class ComfyImageEngine:
         return []
 
     def _inject(self, workflow: dict[str, Any], spec: ImageRequest, bindings: Mapping[str, list[tuple[str, str]]],
-                seed: int, references: list[str]) -> None:
-        values: dict[str, Any] = {"prompt": spec.prompt, "negative_prompt": spec.negative_prompt,
+                seed: int, references: list[str], mask: str | None = None) -> None:
+        values: dict[str, Any] = {"prompt": _effective_prompt(spec), "negative_prompt": spec.negative_prompt,
                                   "seed": seed, "steps": spec.steps, "width": spec.width,
                                   "height": spec.height, "guidance": spec.guidance}
         for field, value in values.items():
@@ -574,7 +642,7 @@ class ComfyImageEngine:
                 # still carries its usual width/height fields, but those
                 # fields must not make such a workflow invalid.  Text-to-
                 # image workflows remain required to bind both dimensions.
-                if field in {"width", "height"} and spec.mode == "edit" and spec.images_b64:
+                if field in {"width", "height"} and spec.images_b64:
                     continue
                 # Optional fields are not guessed or silently redirected.  A
                 # non-default request makes the missing explicit binding an
@@ -600,14 +668,25 @@ class ComfyImageEngine:
             else:
                 for (node, input_name), filename in zip(targets, references):
                     workflow[node]["inputs"][input_name] = filename
+        if mask:
+            targets = bindings.get("mask") or []
+            if not targets:
+                raise ComfyConfigError("Masked workflow has no explicit mask binding")
+            if len(targets) != 1:
+                raise ComfyConfigError("Masked workflow must have exactly one mask binding")
+            node, input_name = targets[0]
+            workflow[node]["inputs"][input_name] = mask
 
-    def build_workflow(self, spec: ImageRequest, seed: int, references: list[str] | None = None) -> dict[str, Any]:
-        mode = "t2i" if spec.mode == "generate" else spec.mode
+    def build_workflow(self, spec: ImageRequest, seed: int, references: list[str] | None = None,
+                       mask: str | None = None) -> dict[str, Any]:
+        if spec.mode in ADVANCED_MODES and (not self.config or spec.mode not in self.config.supported_modes):
+            raise ComfyConfigError(f"Mode {spec.mode} is not enabled by this ComfyUI configuration")
+        mode = _workflow_key(spec)
         if not self.config or mode not in self.config.workflows:
             raise ComfyConfigError(f"No configured workflow for mode {mode}")
         workflow_spec = self.config.workflows[mode]
         workflow = copy.deepcopy(workflow_spec.template)
-        self._inject(workflow, spec, workflow_spec.bindings, seed, references or [])
+        self._inject(workflow, spec, workflow_spec.bindings, seed, references or [], mask)
         return workflow
 
     def _upload_references(self, job_id: str, spec: ImageRequest) -> list[str]:
@@ -624,19 +703,31 @@ class ComfyImageEngine:
             uploaded.append(f"{subfolder}/{filename}" if subfolder else str(filename))
         return uploaded
 
+    def _upload_mask(self, job_id: str, spec: ImageRequest) -> str | None:
+        if not spec.mask_b64:
+            return None
+        data = _decode_mask(spec.mask_b64, spec.images_b64[0])
+        response = self.client.upload(data, f"frosty_{job_id}_mask.png")
+        filename = response.get("name", response.get("filename")) if isinstance(response, Mapping) else None
+        if not filename:
+            raise ComfyError("ComfyUI mask upload did not return a filename")
+        subfolder = response.get("subfolder", "") if isinstance(response, Mapping) else ""
+        return f"{subfolder}/{filename}" if subfolder else str(filename)
+
     def _run(self, job_id: str) -> None:
         job = self.get(job_id, private=True)
         spec = _job_spec(job)
         started = time.monotonic()
         self.update(job_id, status="running", stage="Uploading references")
         references = self._upload_references(job_id, spec) if spec.images_b64 else []
+        mask = self._upload_mask(job_id, spec)
         for index in range(spec.n):
             current = self.get(job_id)
             if current.get("cancel"):
                 self.update(job_id, status="cancelled", stage="Cancelled")
                 return
             seed = (job["seed"] + index) % (2**63)
-            workflow = self.build_workflow(spec, seed, references)
+            workflow = self.build_workflow(spec, seed, references, mask)
             self.update(job_id, stage=f"Queueing image {index + 1} of {spec.n}")
             response = self.client.prompt(workflow)
             prompt_id = str(response["prompt_id"])
@@ -721,7 +812,7 @@ class ComfyImageEngine:
             raise ComfyError("ComfyUI history returned invalid outputs")
         descriptors: list[tuple[str, Mapping[str, Any]]] = []
         output_nodes = set()
-        workflow_mode = "t2i" if spec.mode == "generate" else spec.mode
+        workflow_mode = _workflow_key(spec)
         if self.config and workflow_mode in self.config.workflows:
             output_nodes = {node for node, _ in self.config.workflows[workflow_mode].bindings.get("output", [])}
         for node_id, node_output in outputs.items():
@@ -746,14 +837,26 @@ class ComfyImageEngine:
             raw = self.client.view(str(descriptor["filename"]), str(descriptor.get("subfolder", "")), str(descriptor.get("type", "output")))
             with Image.open(io.BytesIO(raw)) as source:
                 image = source.convert("RGBA").copy()
+            if spec.mode == "masked" and spec.preserve_unmasked:
+                original_data, _ = _decode_reference(spec.images_b64[0])
+                mask_data = _decode_mask(spec.mask_b64, spec.images_b64[0])
+                with Image.open(io.BytesIO(original_data)) as source:
+                    original = source.convert("RGBA").copy()
+                if image.size != original.size:
+                    image = image.resize(original.size, Image.Resampling.LANCZOS)
+                with Image.open(io.BytesIO(mask_data)) as source:
+                    mask = source.convert("L").copy()
+                image = Image.composite(image, original, mask)
             name = f"image_{time.strftime('%Y%m%d_%H%M%S')}_{seed}_{secrets.token_hex(4)}.png"
             metadata = {
-                "prompt": spec.prompt, "effective_prompt": spec.prompt, "negative_prompt": spec.negative_prompt,
+                "prompt": spec.prompt, "effective_prompt": _effective_prompt(spec),
+                "negative_prompt": spec.negative_prompt,
                 "seed": seed, "mode": spec.mode,
                 "width": image.width, "height": image.height, "num_inference_steps": spec.steps,
                 "guidance": spec.guidance, "reference_count": len(spec.images_b64),
                 "engine_id": "comfyui", "engine_label": "ComfyUI", "comfy_prompt_id": prompt_id,
                 "variation": variation, "created_at": time.time(),
+                "preserve_unmasked": spec.preserve_unmasked if spec.mode == "masked" else None,
             }
             with self.lock:
                 if self.jobs[job_id].get("cancel"):
@@ -807,18 +910,31 @@ def startup():
 
 @app.get("/health")
 def health():
-    edit_refs = []
-    if engine.config and "edit" in engine.config.workflows:
-        edit_bindings = engine.config.workflows["edit"].bindings
+    def reference_limit(workflow_name: str) -> int:
+        if not engine.config or workflow_name not in engine.config.workflows:
+            return 0
+        bindings = engine.config.workflows[workflow_name].bindings
         for key in ("references", "reference", "images", "image"):
-            if edit_bindings.get(key):
-                edit_refs = edit_bindings[key]
-                break
-    max_references = len(edit_refs) if edit_refs else 0
+            if bindings.get(key):
+                return len(bindings[key])
+        return 0
+
+    max_references = reference_limit("edit")
     capabilities = ["text_to_image", "image_edit"]
     if max_references > 1:
         capabilities.append("multi_reference")
+    configured_modes = engine.config.supported_modes if engine.config else frozenset()
+    if "transparent" in configured_modes:
+        capabilities.extend(["transparent_png", "transparent_edit"])
+    if "extract" in configured_modes:
+        capabilities.append("subject_extraction")
+    if "masked" in configured_modes:
+        capabilities.append("mask_edit")
+    if "annotate" in configured_modes:
+        capabilities.append("annotation_edit")
     controls = {"max_references": max_references,
+                "max_references_by_mode": {"masked": reference_limit("masked")}
+                if "masked" in configured_modes else {},
                 "resolutions": [384, 512, 1024, 2048],
                 "resolution_default": 384,
                 "edit_reference_resolution": 384,

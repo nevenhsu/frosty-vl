@@ -1,17 +1,17 @@
 # Use Frosty Image with ComfyUI
 
 This adapter keeps Frosty's Image workspace and gallery while an existing local
-ComfyUI installation performs the render. It supports text-to-image and basic
-reference-image editing without loading Frosty's CUDA/Diffusers backend.
+ComfyUI installation performs the render. It supports text-to-image, reference
+editing, and four Qwen Image modes without loading Frosty's CUDA/Diffusers backend.
 
 ```text
 Frosty Image :8890 -> Frosty ComfyUI adapter :8899 -> ComfyUI :8188
 ```
 
 The adapter process itself does not install ComfyUI or download models. The
-portable setup below installs those prerequisites and supplies the two verified
-API-format workflow templates; custom workflows still need their own explicit
-node bindings.
+portable setup below installs those prerequisites and supplies API-format workflow
+templates for text-to-image, reference editing, and masked editing; custom
+workflows still need their own explicit node bindings.
 
 ## Portable Apple Silicon setup
 
@@ -42,19 +42,27 @@ metadata and recoverable Trash live only under `ComfyUI/output/Qwen21`; Frosty
 does not keep a second image copy. The parent-level
 `start-comfyui-qwen21.command` opens ComfyUI by itself for troubleshooting.
 
-## 1. Export both workflows
+## 1. Export the workflows
 
-In ComfyUI, export the working text-to-image and image-edit graphs in **API
-format**. A normal UI workflow is not interchangeable with an API-format export.
-Keep the two JSON files outside the Git repository if they contain private paths
-or custom configuration.
+In ComfyUI, export the working text-to-image, image-edit, and (when enabled)
+masked-edit graphs in **API format**. A normal UI workflow is not interchangeable
+with an API-format export. The repository includes
+`workflows/qwen21_t2i_api.json`, `workflows/qwen21_edit_api.json`, and
+`workflows/qwen21_masked_api.json` as Qwen Image 2.1 templates. Keep custom JSON
+files outside the Git repository if they contain private paths or configuration.
+
+The text-to-image and edit workflows are required. The masked workflow is
+optional, but it must have separate `LoadImage` nodes for the original image and
+the mask. Do not bind a filename list to one `LoadImage` node: the masked graph
+needs one binding for the reference image and another for the mask image.
 
 Record the node ID and input name for each value Frosty should control:
 
 - positive prompt;
 - negative prompt;
 - seed, steps, width, height and guidance/CFG;
-- the `LoadImage`-style input used by the edit workflow.
+- the `LoadImage`-style input used by the edit workflow;
+- for masked editing, separate `LoadImage` inputs for the reference and mask.
 
 Node IDs belong to the exported workflow and can differ from every example. The
 adapter validates every binding and stops with a clear configuration error when a
@@ -80,13 +88,21 @@ cp config/comfyui-image.example.json config/comfyui-image.json
 ```
 
 Edit `config/comfyui-image.json` so `workflows.t2i.path` and
-`workflows.edit.path` point to the two API exports. Replace every example node ID
-and input name under `bindings` with the values from those exports. Relative paths
-are resolved from the configuration file's folder.
+`workflows.edit.path` point to the required API exports. If masked editing is
+enabled, set `workflows.masked.path` to its API export as well. Replace every
+example node ID and input name under `bindings` with the values from those
+exports. Relative paths are resolved from the configuration file's folder.
 
-The edit example binds one reference image. Add an ordered list of explicit
-node/input bindings only when the edit workflow actually accepts multiple images;
-Frosty will otherwise present a one-image editing interface.
+The top-level `supported_modes` list advertises the four modes:
+`transparent`, `extract`, `masked`, and `annotate`. Leave `masked` out of a
+custom configuration when no masked workflow is available; the bundled
+configuration includes it.
+
+The edit example binds one reference image. The bundled masked configuration
+binds the original image to `460.image` and the mask to `475.image` as separate
+inputs. Add an ordered list of explicit node/input bindings only when the edit
+workflow actually accepts multiple images; Frosty will otherwise present a
+one-image editing interface.
 
 ## 3. Start Frosty
 
@@ -114,14 +130,26 @@ copies the workflow template for each job, injects the bound prompt and controls
 queues it through ComfyUI, monitors history, downloads finished images, and saves
 PNG files plus metadata in Frosty's recoverable gallery.
 
-The bundled Qwen Image 2.1 edit workflow derives its canvas from the reference and
-uses detail resolution `384`. While a reference is attached, Studio disables the
-text-to-image size controls and labels this fixed edit behavior explicitly.
+The bundled Qwen Image 2.1 edit and masked workflows derive their canvas from the
+reference and use detail resolution `384`. While a reference is attached, Studio
+disables the text-to-image size controls and labels this fixed edit behavior
+explicitly.
 
-Only `auto`, `generate`, and `edit` modes are accepted. Qwen-specific transparency,
-subject extraction, mask/annotation editing, DWM and official prompt enhancement
-are not claimed by this bridge. Frosty hides unavailable modes based on adapter
-capabilities.
+The four advertised modes are translated as follows:
+
+- **Transparent:** use text-to-image with no reference, or the edit workflow with
+  a reference, to request a transparent result.
+- **Extract:** requires a reference and reuses the edit workflow. Extraction is
+  generative and therefore non-deterministic; it is not deterministic
+  segmentation.
+- **Masked:** requires one reference and one mask and uses the dedicated masked
+  workflow. White mask areas are the regions to modify. When “Keep pixels outside
+  the mask unchanged” is enabled, the adapter performs an exact composite over the
+  original so pixels outside the selected region are preserved.
+- **Annotate:** requires a reference and reuses the edit workflow for the
+  requested annotation change.
+
+Frosty hides unavailable modes based on adapter capabilities and configuration.
 
 ## Troubleshooting
 
@@ -136,5 +164,7 @@ capabilities.
   be applied safely.
 
 Source/config validation and fixture tests do not prove the user's model workflow.
-Completion requires one real small text-to-image job and one real edit job through
-the browser after the two workflow files are supplied.
+This documentation does not claim a real GPU generation. Completion requires
+small consumer-path checks through the browser after the workflow files and model
+runtime are supplied, including a masked job when that optional workflow is
+enabled.

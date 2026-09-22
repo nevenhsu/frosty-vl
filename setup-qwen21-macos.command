@@ -286,7 +286,7 @@ print("Required ComfyUI nodes: passed")
 PY
 )
 FVL_COMFY_IMAGE_CONFIG="$bundle_dir/config/comfyui-image.json" PYTHONPATH="$bundle_dir" \
-  "$adapter_venv/bin/python" -c 'from server.comfy_image_serve import load_config; c=load_config(); assert set(c.workflows)=={"t2i","edit"}'
+  "$adapter_venv/bin/python" -c 'from server.comfy_image_serve import load_config; c=load_config(); assert set(c.workflows)=={"t2i","edit","masked"}; assert set(c.supported_modes)=={"transparent","extract","masked","annotate"}'
 /bin/bash -n "$bundle_dir/start-frosty-qwen21"
 /bin/bash -n "$comfyui_launcher"
 

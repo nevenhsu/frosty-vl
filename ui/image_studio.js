@@ -20,7 +20,7 @@ function updateDimensions(){
 }
 $('#ratio').onchange=updateDimensions;$('#resolution').onchange=updateDimensions;$('#custom-width').oninput=$('#custom-height').oninput=updateDimensions;$('#custom-size').onchange=()=>{$('#custom-dimensions').hidden=!$('#custom-size').checked;$('#ratio').disabled=$('#resolution').disabled=$('#custom-size').checked;if($('#custom-size').checked)$('#auto-ratio').checked=false;updateDimensions();};$('#auto-enhance').onchange=()=>{if(!$('#auto-enhance').checked)$('#auto-ratio').checked=false;};$('#auto-ratio').onchange=()=>{if($('#auto-ratio').checked){$('#auto-enhance').checked=true;$('#custom-size').checked=false;$('#custom-size').onchange();}};
 function formError(message=''){$('#form-error').textContent=message;}
-function referenceLimit(){return Math.max(0,state.maxReferences-(state.mode==='masked'?1:0));}
+function referenceLimit(){const perMode=Number(state.controls.max_references_by_mode?.[state.mode]);if(perMode>0)return Math.min(state.maxReferences,perMode);return Math.max(0,state.maxReferences-(state.mode==='masked'?1:0));}
 function referenceSummary(){const limit=referenceLimit();return `${state.refs.length} / ${limit}`;}
 function setMode(mode){
   if(state.mode!==mode)ctx.clearRect(0,0,paint.width,paint.height);
