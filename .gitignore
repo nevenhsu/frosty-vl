@@ -31,3 +31,6 @@ comfyui/data/*.json
 
 # Optional MCP virtual environment
 .venv-mcp/
+
+# Optional ComfyUI adapter environment
+.venv-comfy/

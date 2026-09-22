@@ -7,7 +7,7 @@ const {JSDOM} = require('jsdom');
 const root = path.join(__dirname, '..');
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
-async function studio() {
+async function studio(studioOptions={}) {
   const dom = new JSDOM(fs.readFileSync(path.join(root,'ui/image_studio.html'),'utf8'),
     {url:'http://localhost/image', runScripts:'outside-only'});
   const w = dom.window, requests=[];
@@ -21,7 +21,7 @@ async function studio() {
     const payload=options.body?JSON.parse(options.body):null;
     requests.push({url,payload});
     let data={};
-    if(url==='/api/images/health')data={ready:true,dwm:{enabled:true},dwm_default_scale:0.75,prompt_enhancement:{t2i:true,edit:true}};
+    if(url==='/api/images/health')data=studioOptions.health||{ready:true,dwm:{enabled:true},dwm_default_scale:0.75,prompt_enhancement:{t2i:true,edit:true}};
     else if(url==='/api/workspaces')data={image:true,video:true};
     else if(url==='/api/images/gallery')data={ok:true,count:trashed?0:1,items:trashed?[]:photos,trash_count:trashed?1:0};
     else if(url==='/api/images/gallery/trash'&&payload){trashed=true;data={ok:true,results:[{ok:true,name:'fixture.png',trash_id:'b'.repeat(32)}]};}
@@ -94,5 +94,67 @@ test('gallery delete, Undo, Trash view and restore use backend IDs',async()=>{
     w.document.querySelector('#show-trash').click();await settle();
     assert.equal(w.document.querySelector('#restore-selected').hidden,false);
     assert.match(w.document.querySelector('#gallery').textContent,/Restore/);
+  } finally {close();}
+});
+
+test('basic Comfy image capabilities disable Qwen-only modes and bound references',async()=>{
+  const health={ready:true,capabilities:['text_to_image','image_edit'],controls:{max_references:1,
+    resolutions:[384,512,1024,2048],resolution_default:384,edit_reference_resolution:384,
+    steps:{min:1,max:200,default:20}},
+    dwm:{enabled:false},dwm_default_scale:0,prompt_enhancement:{t2i:false,edit:false}};
+  const {w,requests,close}=await studio({health});
+  try {
+    await w.eval('refreshHealth()');
+    for(const mode of ['transparent','extract','masked','annotate'])
+      assert.equal(w.document.querySelector(`[data-mode="${mode}"]`).hidden,true,
+        JSON.stringify({mode,capabilities:Array.from(w.eval('state.capabilities')),health:w.document.querySelector('#health').textContent}));
+    assert.equal(w.document.querySelector('#auto-enhance').checked,false);
+    assert.equal(w.document.querySelector('#auto-enhance').disabled,true);
+    assert.equal(w.document.querySelector('#reference-count').textContent,'0 / 1');
+    assert.equal(w.document.querySelector('#resolution').value,'384');
+    assert.equal(w.document.querySelector('#steps').value,'20');
+    await w.eval('addFiles([{name:"source.png"}])');
+    assert.equal(w.document.querySelector('#resolution').disabled,true);
+    assert.equal(w.document.querySelector('#custom-size').disabled,true);
+    assert.equal(w.document.querySelector('#dimensions').textContent,'Reference-derived · detail 384');
+    await w.eval('addFiles([{name:"overflow.png"}])');
+    assert.equal(w.eval('state.refs.length'),1);
+    assert.match(w.document.querySelector('#form-error').textContent,/up to 1/);
+    w.document.querySelector('#prompt').value='Turn the source into a watercolor painting';
+    await w.eval('generate()');
+    const request=requests.find(r=>r.url==='/api/images/jobs').payload;
+    assert.equal(request.mode,'auto');
+    assert.deepEqual(request.images_b64,['data:source.png']);
+    for(const field of ['enhance_prompt','auto_aspect_ratio','dwm_scale','use_kv_cache','reference_resolution','preserve_unmasked'])
+      assert.equal(field in request,false);
+  } finally {close();}
+});
+
+test('native image controls retain the 1K and 40-step defaults',async()=>{
+  const health={ready:true,controls:{max_references:10,resolutions:[512,1024,2048],
+    resolution_default:1024,steps:{min:1,max:80,default:40}},
+    dwm:{enabled:false},prompt_enhancement:{t2i:true,edit:true}};
+  const {w,close}=await studio({health});
+  try {
+    await w.eval('refreshHealth()');
+    assert.deepEqual(Array.from(w.document.querySelector('#resolution').options).map(option=>option.value),['512','1024','2048']);
+    assert.equal(w.document.querySelector('#resolution').value,'1024');
+    assert.equal(w.document.querySelector('#steps').value,'40');
+  } finally {close();}
+});
+
+test('multi-reference Comfy capability does not send Qwen-only controls',async()=>{
+  const health={ready:true,capabilities:['text_to_image','image_edit','multi_reference'],controls:{max_references:2},
+    dwm:{enabled:false},prompt_enhancement:{t2i:false,edit:false}};
+  const {w,requests,close}=await studio({health});
+  try {
+    await w.eval('refreshHealth()');
+    await w.eval('addFiles([{name:"first.png"},{name:"second.png"}])');
+    w.document.querySelector('#prompt').value='Combine both references';
+    await w.eval('generate()');
+    const request=requests.find(r=>r.url==='/api/images/jobs').payload;
+    assert.equal(request.images_b64.length,2);
+    assert.equal('use_kv_cache' in request,false);
+    assert.equal('reference_resolution' in request,false);
   } finally {close();}
 });

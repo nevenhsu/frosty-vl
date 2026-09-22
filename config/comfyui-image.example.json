@@ -1,0 +1,31 @@
+{
+  "comfyui_url": "http://127.0.0.1:8188",
+  "output_dir": "../outputs/images",
+  "workflows": {
+    "t2i": {
+      "path": "../workflows/qwen21_t2i_api.json",
+      "bindings": {
+        "prompt": ["6", "text"],
+        "negative_prompt": ["7", "text"],
+        "seed": ["3", "seed"],
+        "steps": ["3", "steps"],
+        "width": ["5", "width"],
+        "height": ["5", "height"],
+        "guidance": ["3", "cfg"]
+      }
+    },
+    "edit": {
+      "path": "../workflows/qwen21_edit_api.json",
+      "bindings": {
+        "prompt": ["6", "text"],
+        "negative_prompt": ["7", "text"],
+        "seed": ["3", "seed"],
+        "steps": ["3", "steps"],
+        "width": ["5", "width"],
+        "height": ["5", "height"],
+        "guidance": ["3", "cfg"],
+        "reference": ["10", "image"]
+      }
+    }
+  }
+}

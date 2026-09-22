@@ -405,6 +405,10 @@ def health():
     return dict(status="error" if engine.error else "loading" if engine.loading else "ok",
                 ready=engine.ready, loading=engine.loading, error=engine.error,
                 model=MODEL_ID, quantization=QUANTIZATION, capabilities=CAPABILITIES,
+                controls={"max_references": 10, "resolutions": [512, 1024, 2048],
+                          "resolution_default": 1024,
+                          "steps": {"min": 1, "max": 80, "default": 40},
+                          "kv_cache": True, "reference_resolution": True},
                 dwm=DWM_STATUS, dwm_default_scale=DWM_DEFAULT_SCALE,
                 prompt_enhancement=qwen_prompt_enhance.available(MODEL_DIR),
                 active_job=engine.active, queued=engine.pending.qsize())

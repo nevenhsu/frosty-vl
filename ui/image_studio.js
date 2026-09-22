@@ -1,15 +1,27 @@
 'use strict';
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
-const state = {mode:'auto', refs:[], ready:false, enhancementReady:false, enhancement:null, job:null, tool:'brush', drawing:false, start:null, paintSnapshot:null};
+const state = {mode:'auto', refs:[], ready:false, enhancementReady:false, enhancement:null, job:null, tool:'brush', drawing:false, start:null, paintSnapshot:null, capabilities:new Set(), controls:{}, controlsInitialized:false, maxReferences:10, dwmEnabled:false};
 const sizes = {'1:1':[2048,2048],'4:3':[2400,1792],'3:4':[1792,2400],'3:2':[2528,1696],'2:3':[1696,2528],'16:9':[2752,1536],'9:16':[1536,2752]};
 const hints = {auto:'Create with a prompt, or add references to edit and compose.',generate:'Describe the image you want to create.',edit:'Describe how to change or combine your references.',transparent:'Create a transparent image or edit an existing RGBA layer.',extract:'Name the subject to keep on a transparent background.',masked:'Describe the change inside your painted region.',annotate:'Draw circles or marks, then describe your edit.'};
 const paint = $('#paint'), ctx = paint.getContext('2d', {willReadFrequently:true});
 
 function dimensions(){if($('#custom-size').checked)return [Number($('#custom-width').value),Number($('#custom-height').value)];const scale=Number($('#resolution').value)/2048;return sizes[$('#ratio').value].map(v=>Math.round(v*scale/32)*32);}
-function updateDimensions(){const [w,h]=dimensions();$('#dimensions').textContent=`${w} × ${h}`;}
+function updateDimensions(){
+  const editResolution=Number(state.controls.edit_reference_resolution);
+  if(state.refs.length&&editResolution>0){
+    $('#custom-size').checked=false;$('#custom-size').disabled=true;$('#custom-dimensions').hidden=true;
+    $('#ratio').disabled=$('#resolution').disabled=true;
+    $('#dimensions').textContent=`Reference-derived · detail ${editResolution}`;return;
+  }
+  $('#custom-size').disabled=false;
+  $('#ratio').disabled=$('#resolution').disabled=$('#custom-size').checked;
+  const [w,h]=dimensions();$('#dimensions').textContent=`${w} × ${h}`;
+}
 $('#ratio').onchange=updateDimensions;$('#resolution').onchange=updateDimensions;$('#custom-width').oninput=$('#custom-height').oninput=updateDimensions;$('#custom-size').onchange=()=>{$('#custom-dimensions').hidden=!$('#custom-size').checked;$('#ratio').disabled=$('#resolution').disabled=$('#custom-size').checked;if($('#custom-size').checked)$('#auto-ratio').checked=false;updateDimensions();};$('#auto-enhance').onchange=()=>{if(!$('#auto-enhance').checked)$('#auto-ratio').checked=false;};$('#auto-ratio').onchange=()=>{if($('#auto-ratio').checked){$('#auto-enhance').checked=true;$('#custom-size').checked=false;$('#custom-size').onchange();}};
 function formError(message=''){$('#form-error').textContent=message;}
+function referenceLimit(){return Math.max(0,state.maxReferences-(state.mode==='masked'?1:0));}
+function referenceSummary(){const limit=referenceLimit();return `${state.refs.length} / ${limit}`;}
 function setMode(mode){
   if(state.mode!==mode)ctx.clearRect(0,0,paint.width,paint.height);
   state.mode=mode;
@@ -17,8 +29,8 @@ function setMode(mode){
   $('#mode-hint').textContent=mode==='auto'&&state.refs.length?'Describe how to edit or combine your references.':hints[mode];
   $('#generate span').textContent=(mode==='auto'&&!state.refs.length)||mode==='transparent'?'Generate image':'Apply edit';
   $('#automatic-mode-label').textContent=state.refs.length?'Edit / compose · automatic':'Create / edit automatically';
-  $('#reference-count').textContent=`${state.refs.length} / ${mode==='masked'?9:10}`;
-  $('#reference-hint').textContent=mode==='masked'?'Up to 9 references + 1 mask. Image 1 is the canvas; white marks the edit region.':'No images: create something new. Add up to ten references to edit or compose. Mention “image 1” or “image 2” in your direction.';
+  $('#reference-count').textContent=referenceSummary();
+  $('#reference-hint').textContent=mode==='masked'?`Up to ${referenceLimit()} references + 1 mask. Image 1 is the canvas; white marks the edit region.`:`No images: create something new. Add up to ${referenceLimit()} references to edit or compose. Mention “image 1” or “image 2” in your direction.`;
   invalidateEnhancement();refreshEditor();formError();
 }
 $$('[data-mode]').forEach(b=>b.onclick=()=>setMode(b.dataset.mode));
@@ -34,7 +46,7 @@ const drop=$('#drop-zone');drop.ondragover=e=>{e.preventDefault();drop.classList
 document.addEventListener('paste',e=>{const files=[...(e.clipboardData?.files||[])].filter(f=>f.type.startsWith('image/'));if(files.length){e.preventDefault();addFiles(files);}});
 function renderRefs(){
   const root=$('#reference-list');root.replaceChildren();
-  $('#reference-count').textContent=`${state.refs.length} / ${state.mode==='masked'?9:10}`;
+  $('#reference-count').textContent=referenceSummary();
   $('#clear-references').disabled=!state.refs.length;
   state.refs.forEach((ref,index)=>{
     const item=document.createElement('div');item.className='reference';item.draggable=true;
@@ -62,14 +74,51 @@ function maskData(){const pixels=ctx.getImageData(0,0,paint.width,paint.height);
 $('#mask-upload').onchange=async e=>{const file=e.target.files[0];if(!file)return;try{const url=URL.createObjectURL(file);try{const image=await loadImage(url);if(image.naturalWidth!==paint.width||image.naturalHeight!==paint.height)throw new Error(`Mask must match the resized reference: ${paint.width} × ${paint.height}.`);ctx.clearRect(0,0,paint.width,paint.height);ctx.drawImage(image,0,0);const pixels=ctx.getImageData(0,0,paint.width,paint.height);for(let i=0;i<pixels.data.length;i+=4){const v=pixels.data[i];pixels.data[i]=255;pixels.data[i+1]=85;pixels.data[i+2]=100;pixels.data[i+3]=v;}ctx.putImageData(pixels,0,0);}finally{URL.revokeObjectURL(url);}formError();}catch(error){formError(error.message);}e.target.value='';};
 
 async function api(path,options={}){const response=await fetch(path,{cache:'no-store',...options});const data=await response.json();if(!response.ok){const detail=data.detail||data.error;throw new Error(Array.isArray(detail)?detail.map(x=>x.msg).join('; '):detail||`HTTP ${response.status}`);}return data;}
-async function refreshHealth(){try{const h=await api('/api/images/health');syncDwm(h);state.ready=!!h.ready;state.enhancementReady=!!h.prompt_enhancement?.t2i&&!!h.prompt_enhancement?.edit;$('#dot').className=state.ready?'ready':h.error?'error':'';$('#health').textContent=state.ready?'Ready':h.loading?'Loading model':'Offline';$('#health').title=h.error||'';}catch{state.ready=false;$('#health').textContent='Connecting';}$('#generate').disabled=!state.ready||!!state.job;$('#enhance').disabled=!state.ready||!state.enhancementReady||!!state.job;$('#enhance-hint').textContent=state.enhancementReady?'Preview before applying':'Enhancers loading';}
+function applyCapabilities(health){
+  const legacyCapabilities=['text_to_image','image_edit','multi_reference','transparent_png','transparent_edit','subject_extraction','mask_edit','annotation_edit'];
+  state.capabilities=new Set(health.capabilities||legacyCapabilities);
+  state.controls=health.controls||{};
+  if(!state.controlsInitialized){
+    const resolutions=Array.isArray(state.controls.resolutions)?state.controls.resolutions.filter(value=>Number(value)>0):[];
+    if(resolutions.length){
+      const labels={384:'384 · test',512:'512 · draft',1024:'1K · standard',2048:'2K · large'};
+      $('#resolution').replaceChildren(...resolutions.map(value=>{const option=document.createElement('option');option.value=String(value);option.textContent=labels[value]||String(value);return option;}));
+      const preferred=Number(state.controls.resolution_default);
+      $('#resolution').value=String(resolutions.includes(preferred)?preferred:resolutions[0]);
+    }
+    const steps=state.controls.steps;
+    if(steps&&typeof steps==='object'){
+      if(Number.isFinite(Number(steps.min)))$('#steps').min=String(steps.min);
+      if(Number.isFinite(Number(steps.max)))$('#steps').max=String(steps.max);
+      if(Number.isFinite(Number(steps.default)))$('#steps').value=String(steps.default);
+    }
+    state.controlsInitialized=true;
+  }
+  state.maxReferences=Math.max(1,Number(state.controls.max_references)||10);
+  const modeCapabilities={transparent:'transparent_png',extract:'subject_extraction',masked:'mask_edit',annotate:'annotation_edit'};
+  for(const [mode,capability] of Object.entries(modeCapabilities))$(`[data-mode="${mode}"]`).hidden=!state.capabilities.has(capability);
+  $('#references-section').hidden=!state.capabilities.has('image_edit');
+  if($(`[data-mode="${state.mode}"]`)?.hidden)setMode('auto');
+  const autoEnhance=$('#auto-enhance'),autoRatio=$('#auto-ratio');
+  autoEnhance.disabled=!state.enhancementReady;
+  autoRatio.disabled=!state.enhancementReady;
+  if(!state.enhancementReady){autoEnhance.checked=false;autoRatio.checked=false;}
+  renderRefs();updateDimensions();
+}
+async function refreshHealth(){try{const h=await api('/api/images/health');syncDwm(h);state.ready=!!h.ready;state.enhancementReady=!!h.prompt_enhancement?.t2i&&!!h.prompt_enhancement?.edit;applyCapabilities(h);$('#dot').className=state.ready?'ready':h.error?'error':'';$('#health').textContent=state.ready?'Ready':h.loading?'Loading model':'Offline';$('#health').title=h.error||'';}catch{state.ready=false;$('#health').textContent='Connecting';}$('#generate').disabled=!state.ready||!!state.job;$('#enhance').disabled=!state.ready||!state.enhancementReady||!!state.job;$('#enhance-hint').textContent=state.enhancementReady?'Preview before applying':'Prompt enhancement unavailable';}
 function displayUrl(output){return '/api/images/files/'+encodeURIComponent(output.name);}
 function resultCard(output,container){const article=document.createElement('article');article.className='result-card';article.dataset.name=output.name;const image=document.createElement('img');image.src=displayUrl(output);image.className='checker';image.alt='Generated image';const actions=document.createElement('div');actions.className='result-actions';const meta=document.createElement('span');meta.textContent=`${output.width||''} × ${output.height||''} · seed ${output.seed}`;const right=document.createElement('div');const reuse=document.createElement('button');reuse.className='quiet';reuse.textContent='Add reference';reuse.onclick=()=>useAsReference(output.name);const link=document.createElement('a');link.href=image.src;link.download=output.name;link.textContent='Download PNG ↓';const remove=document.createElement('button');remove.className='quiet danger';remove.textContent='Delete';remove.onclick=async()=>{const item=galleryItems.find(i=>i.name===output.name);if(item)await trashImages([item.id]);else formError('Refresh the gallery and try again.');};right.append(reuse,link,remove);actions.append(meta,right);article.append(image,actions);container.append(article);}
 async function useAsReference(name){
   await addGalleryReferences([name]);
 }
-async function generate(enhance=false){if(state.job||!state.ready)return;await referenceIngestion;formError();try{const prompt=$('#prompt').value.trim();if(!prompt)throw new Error('Enter a direction first.');const [width,height]=dimensions();if(width<256||height<256||width>4096||height>4096||width%32||height%32||width*height>4500000)throw new Error('Use dimensions from 256 to 4096 in multiples of 32, up to 4.5 megapixels.');if((enhance||$('#auto-enhance').checked)&&!state.enhancementReady)throw new Error('The official prompt enhancers are still installing. Turn off automatic enhancement to render now.');const seedText=$('#seed').value.trim();if(seedText&&!/^\d+$/.test(seedText))throw new Error('Seed must be a positive whole number.');const seed=seedText?Number(seedText):null;if(seed!==null&&!Number.isSafeInteger(seed))throw new Error('Seed is too large.');const refs=state.refs.map(r=>r.data);if(state.mode==='masked'&&refs.length>9)throw new Error('Mask editing allows nine references plus one mask.');if(['edit','extract','masked','annotate'].includes(state.mode)&&!refs.length)throw new Error('Add at least one reference image.');if(state.mode==='annotate'){const canvas=document.createElement('canvas');canvas.width=paint.width;canvas.height=paint.height;const context=canvas.getContext('2d');context.drawImage(await loadImage(refs[0]),0,0);context.drawImage(paint,0,0);refs[0]=canvas.toDataURL('image/png');}
-const payload={prompt,enhance_prompt:!enhance&&$('#auto-enhance').checked,auto_aspect_ratio:!enhance&&$('#auto-enhance').checked&&$('#auto-ratio').checked,mode:state.mode,images_b64:refs,width,height,seed,num_inference_steps:Number($('#steps').value),n:Number($('#count').value),negative_prompt:$('#negative').value.trim(),true_cfg_scale:Number($('#guidance').value),dwm_scale:Number($('#dwm-scale').value),use_kv_cache:$('#kv-cache').checked,reference_resolution:Number($('#reference-detail').value),preserve_unmasked:$('#preserve').checked};if(state.mode==='masked')payload.mask_b64=maskData();if(payload.negative_prompt&&payload.true_cfg_scale<=1)throw new Error('Set guidance above 1 to use a negative prompt.');if(payload.true_cfg_scale>1&&!payload.negative_prompt)throw new Error('Add a negative prompt or set guidance to 1.');$('#generate').disabled=true;state.submittedVersion=state.inputVersion;const job=await api(enhance?'/api/images/enhance':'/api/images/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});state.job=job.id;localStorage.setItem('frosty.imageJob',job.id);$('#enhance').disabled=true;if(enhance){$('#enhance-preview').hidden=true;}else{$('#results').replaceChildren();$('#canvas-title').textContent=prompt;$('#gallery-section').hidden=true;}await watchJob();}catch(error){formError(error.message);$('#generate').disabled=!state.ready||!!state.job;}}
+async function generate(enhance=false){if(state.job||!state.ready)return;await referenceIngestion;formError();try{const prompt=$('#prompt').value.trim();if(!prompt)throw new Error('Enter a direction first.');const [width,height]=dimensions();if(width<256||height<256||width>4096||height>4096||width%32||height%32||width*height>4500000)throw new Error('Use dimensions from 256 to 4096 in multiples of 32, up to 4.5 megapixels.');if((enhance||$('#auto-enhance').checked)&&!state.enhancementReady)throw new Error('The official prompt enhancers are still installing. Turn off automatic enhancement to render now.');const seedText=$('#seed').value.trim();if(seedText&&!/^\d+$/.test(seedText))throw new Error('Seed must be a positive whole number.');const seed=seedText?Number(seedText):null;if(seed!==null&&!Number.isSafeInteger(seed))throw new Error('Seed is too large.');const refs=state.refs.map(r=>r.data);if(state.mode==='masked'&&refs.length>referenceLimit())throw new Error(`Mask editing allows ${referenceLimit()} references plus one mask.`);if(['edit','extract','masked','annotate'].includes(state.mode)&&!refs.length)throw new Error('Add at least one reference image.');if(state.mode==='annotate'){const canvas=document.createElement('canvas');canvas.width=paint.width;canvas.height=paint.height;const context=canvas.getContext('2d');context.drawImage(await loadImage(refs[0]),0,0);context.drawImage(paint,0,0);refs[0]=canvas.toDataURL('image/png');}
+const payload={prompt,mode:state.mode,images_b64:refs,width,height,seed,num_inference_steps:Number($('#steps').value),n:Number($('#count').value),negative_prompt:$('#negative').value.trim(),true_cfg_scale:Number($('#guidance').value)};
+if(state.enhancementReady){payload.enhance_prompt=!enhance&&$('#auto-enhance').checked;payload.auto_aspect_ratio=payload.enhance_prompt&&$('#auto-ratio').checked;}
+if(state.controls.kv_cache)payload.use_kv_cache=$('#kv-cache').checked;
+if(state.controls.reference_resolution)payload.reference_resolution=Number($('#reference-detail').value);
+if(state.dwmEnabled)payload.dwm_scale=Number($('#dwm-scale').value);
+if(state.mode==='masked'){payload.mask_b64=maskData();payload.preserve_unmasked=$('#preserve').checked;}
+if(payload.negative_prompt&&payload.true_cfg_scale<=1)throw new Error('Set guidance above 1 to use a negative prompt.');if(payload.true_cfg_scale>1&&!payload.negative_prompt)throw new Error('Add a negative prompt or set guidance to 1.');$('#generate').disabled=true;state.submittedVersion=state.inputVersion;const job=await api(enhance?'/api/images/enhance':'/api/images/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});state.job=job.id;localStorage.setItem('frosty.imageJob',job.id);$('#enhance').disabled=true;if(enhance){$('#enhance-preview').hidden=true;}else{$('#results').replaceChildren();$('#canvas-title').textContent=prompt;$('#gallery-section').hidden=true;}await watchJob();}catch(error){formError(error.message);$('#generate').disabled=!state.ready||!!state.job;}}
 $('#generate').onclick=()=>generate();$('#enhance').onclick=()=>generate(true);document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();generate();}});
 async function watchJob(){if(!state.job)return;$('#status-panel').hidden=false;try{const job=await api('/api/images/jobs/'+state.job);$('#job-stage').textContent=job.stage;$('#progress').max=job.total_steps||1;$('#progress').value=job.completed_steps||0;$('#elapsed').textContent=`${Math.floor(Date.now()/1000-job.created_at)} seconds elapsed`;
 if(['done','error','cancelled'].includes(job.status)){state.job=null;localStorage.removeItem('frosty.imageJob');$('#spinner').hidden=true;$('#cancel').hidden=true;$('#generate').disabled=!state.ready;if(job.outputs?.length){$('#results').replaceChildren();job.outputs.forEach(o=>resultCard(o,$('#results')));}if(job.status==='error'){formError(job.error);$('#job-stage').textContent='Render stopped';}if(job.status==='done'){$('#elapsed').textContent=`Completed in ${job.seconds}s`;if(job.enhancement)showEnhancement(job.enhancement,job.kind==='image');}$('#enhance').disabled=!state.ready||!state.enhancementReady;await loadGallery();return;}$('#spinner').hidden=false;$('#cancel').hidden=false;setTimeout(watchJob,1500);}catch(error){formError(error.message);if(error.message==='Unknown image job'){state.job=null;localStorage.removeItem('frosty.imageJob');$('#generate').disabled=!state.ready;}else setTimeout(watchJob,5000);}}
@@ -99,10 +148,10 @@ $('#discard-enhanced').onclick=()=>{$('#enhance-preview').hidden=true;state.enha
 
 function invalidateEnhancement(){state.inputVersion=(state.inputVersion||0)+1;if($('#enhance-preview'))$('#enhance-preview').hidden=true;state.enhancement=null;}
 $('#prompt').addEventListener('input',invalidateEnhancement);
-function referencesChanged(){invalidateEnhancement();ctx.clearRect(0,0,paint.width,paint.height);setMode(state.mode);renderRefs();}
+function referencesChanged(){invalidateEnhancement();ctx.clearRect(0,0,paint.width,paint.height);setMode(state.mode);renderRefs();updateDimensions();}
 function ingestReferences(loader){
   referenceIngestion=referenceIngestion.then(async()=>{
-    const added=await loader(),limit=state.mode==='masked'?9:10;
+    const added=await loader(),limit=referenceLimit();
     if(state.refs.length+added.length>limit)throw new Error(`Use up to ${limit} references${state.mode==='masked'?' plus one mask':''}.`);
     state.refs.push(...added);referencesChanged();
   }).catch(error=>{formError(error.message);});return referenceIngestion;
@@ -120,6 +169,7 @@ async function addGalleryReferences(names){
 }
 function syncDwm(health){
   const enabled=!!health.dwm?.enabled,select=$('#dwm-scale');
+  state.dwmEnabled=enabled;
   if(!state.dwmInitialized&&!state.dwmTouched){const value=String(health.dwm_default_scale??0);if(![...select.options].some(o=>o.value===value))select.add(new Option(value,value));select.value=value;state.dwmInitialized=true;}
   select.disabled=!enabled;$('#dwm-status').textContent=enabled?'Active on the image encoder · saved with every image':'No DWM profile loaded · clean image encoder';
 }

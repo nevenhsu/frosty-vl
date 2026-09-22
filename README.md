@@ -164,6 +164,7 @@ management. An agent should report those boundaries clearly.
 | --- | --- |
 | [Getting started](GETTING-STARTED.md) | Select the installation path and understand prerequisites |
 | [Windows Image setup](docs/WINDOWS-IMAGE-SETUP.md) | Clone, environment, verified model downloads, engine, Studio, first image |
+| [ComfyUI Image adapter](COMFYUI-IMAGE.md) | Use the Frosty Image interface with existing text-to-image and edit workflows |
 | [Image Studio](IMAGE-STUDIO.md) | References, enhancement, editing, controls, DWM and Image API |
 | [Video setup](docs/VIDEO-SETUP.md) | Model compatibility, separate artifacts, Docker topology and verification |
 | [Video Studio](VIDEO-STUDIO.md) | Queue, Scene Lab, gallery, persistence and video API |

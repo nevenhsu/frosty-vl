@@ -1,0 +1,119 @@
+{
+  "451": {
+    "inputs": {
+      "unet_name": "qwen-image-2.1-Q4_K_M.gguf"
+    },
+    "class_type": "UnetLoaderGGUF",
+    "_meta": {
+      "title": "01 主模型 | Unet Loader (GGUF)"
+    }
+  },
+  "453": {
+    "inputs": {
+      "clip_name": "qwen3vl_8b_int8_convrot.safetensors",
+      "type": "qwen_image",
+      "device": "cpu"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "02 INT8 文字編碼器 | CPU"
+    }
+  },
+  "454": {
+    "inputs": {
+      "vae_name": "qwen_image_2.1_vae_bf16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "03 Qwen-Image-2.1 專用 VAE"
+    }
+  },
+  "452": {
+    "inputs": {
+      "clip": [
+        "453",
+        0
+      ],
+      "prompt": "一只白色陶瓷咖啡杯放在木桌上，柔和的自然窗光，真實產品攝影，乾淨背景，細緻材質。",
+      "negative_prompt": "",
+      "resolution": 384
+    },
+    "class_type": "TextEncodeQwenImage21",
+    "_meta": {
+      "title": "04 文字生圖 | 在 prompt 填寫描述"
+    }
+  },
+  "456": {
+    "inputs": {
+      "width": 384,
+      "height": 384,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "05 輸出尺寸 | 384 x 384 / 1 張"
+    }
+  },
+  "458": {
+    "inputs": {
+      "seed": 42,
+      "steps": 20,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0,
+      "model": [
+        "451",
+        0
+      ],
+      "positive": [
+        "452",
+        0
+      ],
+      "negative": [
+        "452",
+        1
+      ],
+      "latent_image": [
+        "456",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "06 採樣 | 20 步 / CFG 1"
+    }
+  },
+  "457": {
+    "inputs": {
+      "samples": [
+        "458",
+        0
+      ],
+      "vae": [
+        "454",
+        0
+      ],
+      "tile_size": 256,
+      "overlap": 64,
+      "temporal_size": 64,
+      "temporal_overlap": 8
+    },
+    "class_type": "VAEDecodeTiled",
+    "_meta": {
+      "title": "07 VAE 分塊解碼"
+    }
+  },
+  "461": {
+    "inputs": {
+      "images": [
+        "457",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "08 暫存結果 | Frosty 取回後保存"
+    }
+  }
+}
