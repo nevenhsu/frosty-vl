@@ -38,7 +38,7 @@ class StudioClient:
             headers['Authorization'] = 'Bearer ' + self.token
         request = urllib.request.Request(self.url+path, data=data, headers=headers)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-        limit = 12_000_000 if binary else 4_000_000
+        limit = 36_000_000 if binary else 4_000_000
         try:
             with opener.open(request, timeout=30) as response:
                 raw = response.read(limit+1)
@@ -109,13 +109,11 @@ class StudioClient:
 
     @staticmethod
     def encode_image(raw):
-        if len(raw)>9_000_000:
-            raise ValueError('Reference image exceeds 9 MB; resize it first')
         try:
             with Image.open(io.BytesIO(raw)) as image:
                 fmt = image.format
-                if fmt not in {'PNG', 'JPEG', 'WEBP'} or image.width*image.height>16_000_000:
-                    raise ValueError('Use PNG/JPEG/WebP images up to 16 megapixels')
+                if fmt not in {'PNG', 'JPEG', 'WEBP'}:
+                    raise ValueError('Use a PNG, JPEG or WebP image')
                 image.verify()
         except (OSError, Image.DecompressionBombError) as exc:
             raise ValueError('Invalid reference image') from exc
@@ -127,8 +125,8 @@ class StudioClient:
             item = await self.asset('image', value)
             raw = await asyncio.to_thread(self._read, item['api_path'], None, True)
         elif value.startswith('data:image/'):
-            if len(value)>12_000_000 or ';base64,' not in value:
-                raise ValueError('Invalid or oversized image data URL')
+            if ';base64,' not in value:
+                raise ValueError('Invalid image data URL')
             try:
                 raw = base64.b64decode(value.split(',',1)[1], validate=True)
             except ValueError as exc:
@@ -139,18 +137,16 @@ class StudioClient:
             path = Path(value).expanduser().resolve(strict=True)
             if not any(path.is_relative_to(root) for root in self.input_dirs):
                 raise ValueError('Image is outside configured input directories')
-            if not path.is_file() or path.stat().st_size>9_000_000:
-                raise ValueError('Expected an image file up to 9 MB')
+            if not path.is_file():
+                raise ValueError('Expected an image file')
             with path.open('rb') as stream:
-                raw = stream.read(9_000_001)
+                raw = stream.read()
         return self.encode_image(raw)
 
     async def image_payload(self, request):
         values = request.model_dump(exclude_none=True)
         images = values.pop('images')
         mask = values.pop('mask', None)
-        if mask and len(images)>9:
-            raise ValueError('A mask allows at most nine reference images')
         values['images_b64'] = [await self.image(value) for value in images]
         if mask:
             values['mask_b64'] = await self.image(mask)

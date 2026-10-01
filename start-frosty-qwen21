@@ -4,13 +4,50 @@ set -euo pipefail
 bundle_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 install_root=${FVL_QWEN21_HOME:-$(dirname "$bundle_dir")}
 comfyui_dir=${FVL_COMFYUI_DIR:-$install_root/ComfyUI}
-model_dir=${FVL_QWEN21_MODEL_DIR:-$install_root/qwen21-downloads/models}
+model_dir=${FVL_QWEN21_MODEL_DIR:-${FVL_MODEL_DIR:-$install_root/qwen21-downloads/models}}
 adapter_python=${FVL_COMFY_PYTHON:-$bundle_dir/.venv-comfy/bin/python}
 comfyui_launcher=$install_root/start-comfyui-qwen21.command
 studio_url=http://127.0.0.1:8890/image
 runtime_dir=""
 comfyui_pid=""
 frosty_pid=""
+profile=${FVL_QWEN21_PROFILE:-turbo}
+cli_profile=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --turbo|--base)
+      requested_profile=${1#--}
+      if [[ -n "$cli_profile" && "$cli_profile" != "$requested_profile" ]]; then
+        echo "Choose only one profile: --base or --turbo." >&2
+        exit 2
+      fi
+      cli_profile=$requested_profile
+      ;;
+    -h|--help)
+      echo "Usage: $0 [--base|--turbo]"
+      echo "Profile: ${cli_profile:-$profile} (FVL_QWEN21_PROFILE may set the default)"
+      echo "ComfyUI: $comfyui_dir"
+      echo "Models: $model_dir"
+      exit 0
+      ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+[[ -z "$cli_profile" ]] || profile=$cli_profile
+
+default_config=$bundle_dir/config/comfyui-image.json
+default_engines=$bundle_dir/config/comfyui-image-engines.json
+if [[ "$profile" == turbo ]]; then
+  default_config=$bundle_dir/config/comfyui-image-turbo.json
+  default_engines=$bundle_dir/config/comfyui-image-turbo-engines.json
+fi
+config_path=${FVL_COMFY_IMAGE_CONFIG:-$default_config}
+engines_path=${FVL_ENGINES_FILE:-$default_engines}
+if [[ -z "${FVL_COMFY_IMAGE_OUTPUT_DIR:-}" && -z "${FVL_COMFY_IMAGE_CONFIG:-}" ]]; then
+  export FVL_COMFY_IMAGE_OUTPUT_DIR=$comfyui_dir/output/Qwen21
+fi
 
 cleanup() {
   trap - EXIT INT TERM
@@ -34,6 +71,8 @@ fail() {
   echo "Error: $*" >&2
   exit 1
 }
+
+[[ "$profile" == base || "$profile" == turbo ]] || fail "FVL_QWEN21_PROFILE must be base or turbo."
 
 wait_for_url() {
   local url=$1
@@ -61,8 +100,43 @@ comfy_ready() {
 
 adapter_ready() {
   curl -fsS --max-time 2 http://127.0.0.1:8899/health 2>/dev/null \
-    | "$adapter_python" -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("ready") is True else 1)' \
+    | "$adapter_python" -c 'import json,sys; data=json.load(sys.stdin); raise SystemExit(0 if data.get("ready") is True and data.get("profile") == sys.argv[1] else 1)' "$profile" \
     >/dev/null 2>&1
+}
+
+check_existing_adapter_profile() {
+  local payload actual
+  payload=$(curl -fsS --max-time 2 http://127.0.0.1:8899/health) || fail "Existing Frosty adapter health could not be read."
+  actual=$(printf '%s' "$payload" | "$adapter_python" -c 'import json,sys; print(json.load(sys.stdin).get("profile", "<missing>"))') \
+    || fail "Existing Frosty adapter health is not valid JSON."
+  if [[ "$actual" != "$profile" ]]; then
+    fail "Existing Frosty adapter uses profile '$actual'; requested '$profile'. Stop it or launch with the matching profile."
+  fi
+}
+
+check_comfy_object_info() {
+  [[ "$profile" == turbo ]] || return 0
+  curl -fsS --max-time 5 http://127.0.0.1:8188/object_info \
+    | "$adapter_python" -c '
+import json, sys
+data = json.load(sys.stdin)
+required = {"FrostyViggleTurboLora", "FrostyViggleTurboSigmas", "BasicGuider", "RandomNoise", "KSamplerSelect", "SamplerCustomAdvanced", "FrostyLoadReferenceImages"}
+missing = sorted(required - set(data))
+if missing:
+    raise SystemExit("Missing required Turbo ComfyUI nodes: " + ", ".join(missing))
+entry = data.get("FrostyViggleTurboLora", {})
+inputs = ((entry.get("input") or {}).get("required") or {}).get("lora_name")
+if isinstance(inputs, list) and inputs and isinstance(inputs[0], list):
+    names = inputs[0]
+elif isinstance(inputs, list):
+    names = inputs
+else:
+    names = []
+expected = "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors"
+if expected not in names:
+    raise SystemExit("Turbo LoRA is not available in ComfyUI object_info: " + expected)
+' \
+    || fail "Turbo ComfyUI preflight failed; required nodes and the verified LoRA must be available."
 }
 
 wait_for_comfy() {
@@ -94,11 +168,20 @@ wait_for_adapter() {
 [[ -x "$comfyui_dir/.venv/bin/python" ]] || fail "ComfyUI Python not found: $comfyui_dir/.venv/bin/python"
 [[ -f "$comfyui_dir/main.py" ]] || fail "ComfyUI main.py not found: $comfyui_dir/main.py"
 [[ -f "$comfyui_dir/custom_nodes/ComfyUI-GGUF/__init__.py" ]] || fail "ComfyUI-GGUF is not installed in $comfyui_dir/custom_nodes"
+if [[ "$profile" == turbo ]]; then
+  [[ -f "$comfyui_dir/custom_nodes/frosty_viggle_turbo_v021/__init__.py" ]] || fail "Turbo node bundle is not installed in $comfyui_dir/custom_nodes"
+  [[ -f "$comfyui_dir/custom_nodes/frosty_viggle_turbo_v021/viggle_turbo.py" ]] || fail "Turbo node bundle is incomplete in $comfyui_dir/custom_nodes"
+fi
 
-for model in \
+models=(
   "$model_dir/diffusion_models/qwen-image-2.1-Q4_K_M.gguf" \
   "$model_dir/text_encoders/qwen3vl_8b_int8_convrot.safetensors" \
-  "$model_dir/vae/qwen_image_2.1_vae_bf16.safetensors"; do
+  "$model_dir/vae/qwen_image_2.1_vae_bf16.safetensors"
+)
+if [[ "$profile" == turbo ]]; then
+  models+=("$model_dir/loras/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors")
+fi
+for model in "${models[@]}"; do
   [[ -f "$model" ]] || fail "Model not found: $model"
 done
 
@@ -110,11 +193,17 @@ if ! "$adapter_python" -c 'import fastapi, PIL, uvicorn' >/dev/null 2>&1; then
   echo "Installing Frosty adapter dependencies..."
   "$adapter_python" -m pip install -r "$bundle_dir/requirements-comfy.txt"
 fi
+output_dir=$(FVL_COMFY_IMAGE_CONFIG="$config_path" PYTHONPATH="$bundle_dir" \
+  "$adapter_python" -c 'from server.comfy_image_serve import load_config; print(load_config().output_dir)') \
+  || fail "Cannot resolve the selected output directory."
 
 studio_running=0
 adapter_running=0
 curl -fsS --max-time 2 "$studio_url" >/dev/null 2>&1 && studio_running=1
 curl -fsS --max-time 2 http://127.0.0.1:8899/health >/dev/null 2>&1 && adapter_running=1
+if ((adapter_running == 1)); then
+  check_existing_adapter_profile
+fi
 if ((studio_running != adapter_running)); then
   fail "Only one Frosty service is running on ports 8890/8899. Stop it, then run this script again."
 fi
@@ -131,6 +220,7 @@ model_config=$runtime_dir/model-paths.yaml
   echo "  diffusion_models: diffusion_models"
   echo "  text_encoders: text_encoders"
   echo "  vae: vae"
+  echo "  loras: loras"
 } >"$model_config"
 
 if comfy_ready; then
@@ -138,27 +228,36 @@ if comfy_ready; then
 else
   echo "Starting ComfyUI at http://127.0.0.1:8188"
   [[ -x "$comfyui_launcher" ]] || fail "ComfyUI launcher not found: $comfyui_launcher. Run setup-qwen21-macos.command first."
-  FVL_NO_BROWSER=1 FVL_COMFYUI_MODEL_CONFIG="$model_config" "$comfyui_launcher" &
+  FVL_NO_BROWSER=1 FVL_COMFYUI_MODEL_CONFIG="$model_config" \
+    FVL_COMFYUI_DIR="$comfyui_dir" FVL_QWEN21_MODEL_DIR="$model_dir" FVL_QWEN21_PROFILE="$profile" \
+    "$comfyui_launcher" &
   comfyui_pid=$!
   wait_for_comfy "$comfyui_pid"
 fi
 
+check_comfy_object_info
+
 if ((studio_running == 1)); then
   wait_for_adapter
   echo "Frosty Studio is already running and ready: $studio_url"
-  echo "Generated images are saved in $comfyui_dir/output/Qwen21"
+  echo "Generated images are saved in $output_dir"
   if [[ ${FVL_NO_BROWSER:-0} != 1 ]]; then open "$studio_url"; fi
   exit 0
 fi
 
 echo "Starting Frosty Studio at $studio_url"
-FVL_COMFY_PYTHON="$adapter_python" "$bundle_dir/scripts/start-comfy-image.sh" &
+profile_arg=--base
+[[ "$profile" == turbo ]] && profile_arg=--turbo
+FVL_COMFY_PYTHON="$adapter_python" FVL_COMFYUI_DIR="$comfyui_dir" \
+  FVL_QWEN21_MODEL_DIR="$model_dir" FVL_QWEN21_PROFILE="$profile" \
+  FVL_COMFY_IMAGE_CONFIG="$config_path" FVL_ENGINES_FILE="$engines_path" \
+  "$bundle_dir/scripts/start-comfy-image.sh" "$profile_arg" &
 frosty_pid=$!
 wait_for_url "$studio_url" "$frosty_pid" "Frosty Studio" 60
 wait_for_adapter "$frosty_pid"
 
 echo "Qwen Image 2.1 is ready: $studio_url"
-echo "Generated images are saved in $comfyui_dir/output/Qwen21"
+echo "Generated images are saved in $output_dir"
 echo "Press Control+C here to stop the services started by this script."
 if [[ ${FVL_NO_BROWSER:-0} != 1 ]]; then
   open "$studio_url"

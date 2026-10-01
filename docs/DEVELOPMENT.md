@@ -13,6 +13,7 @@
 | Video FIFO and lifecycle | `ui/video_jobs.py` |
 | Image engine/API | `server/qwen_image_serve.py` |
 | Official PE adapter | `server/qwen_prompt_enhance.py`, `server/vendor/qwen_pe/` |
+| Pinned Qwen prompt rules | `server/craft_prompt_rules.py`, `server/vendor/craft_skills/qwen-image-gen/` |
 | Optional Image DWM | `server/image_dwm.py` |
 | File libraries and Trash | `server/image_library.py`, `server/video_library.py` |
 | Modular video loader/API | `server/pipeline_load.py`, `server/serve.py` |

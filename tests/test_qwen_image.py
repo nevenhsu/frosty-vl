@@ -28,11 +28,10 @@ def rgba():
 
 
 @pytest.mark.parametrize("updates", [
-    {"prompt": " "}, {"width": 257}, {"height": 255}, {"width": 4096, "height": 4096},
-    {"n": 5}, {"seed": -1}, {"num_inference_steps": 0}, {"true_cfg_scale": 11},
-    {"dwm_scale": -0.01}, {"dwm_scale": 2.01},
-    {"negative_prompt": "blur"}, {"true_cfg_scale": 2}, {"mode": "edit"}, {"mode": "extract"},
-    {"mode": "masked"}, {"mode": "annotate"}, {"mask_b64": "x"}, {"invented_parameter": True},
+    {"width": 0}, {"height": 0}, {"n": 0}, {"seed": -1}, {"num_inference_steps": 0},
+    {"true_cfg_scale": float("inf")}, {"dwm_scale": float("nan")},
+    {"mode": "edit"}, {"mode": "extract"}, {"mode": "masked"}, {"mode": "annotate"},
+    {"mask_b64": "x"}, {"invented_parameter": True},
 ])
 def test_invalid_controls_rejected(updates):
     with pytest.raises(ValidationError):
@@ -54,10 +53,10 @@ def test_reference_order_and_limits(rgba):
     spec = q.ImageRequest(prompt="combine these", mode="edit", images_b64=[rgba] * 10)
     _, images, _ = q.prepare_inputs(spec)
     assert len(images) == 10
-    with pytest.raises(ValidationError):
-        q.ImageRequest(prompt="combine", mode="edit", images_b64=[rgba] * 11)
-    with pytest.raises(ValidationError):
-        q.ImageRequest(prompt="combine", mode="masked", images_b64=[rgba] * 10, mask_b64=rgba)
+    spec = q.ImageRequest(prompt="combine", mode="edit", images_b64=[rgba] * 17)
+    assert len(q.prepare_inputs(spec)[1]) == 17
+    spec = q.ImageRequest(prompt="combine", mode="masked", images_b64=[rgba] * 16, mask_b64=rgba)
+    assert len(q.prepare_inputs(spec)[1]) == 17
 
 
 def test_auto_mode_selects_from_reference_presence(rgba):
@@ -83,11 +82,27 @@ def test_image_library_api_and_hidden_file(engine):
     assert client.post("/gallery/trash", json={"ids": []}).status_code == 422
 
 
+@pytest.mark.parametrize("source", ["photos", "trash"])
+def test_permanent_delete_api_pair_and_required_source(engine, source):
+    client = TestClient(q.app)
+    item = engine.library.publish(Image.new("RGBA", (8, 8)), "purge.png", {"seed": 1})
+    identifier = item["id"]
+    if source == "trash":
+        identifier = engine.library.move_to_trash(identifier)["id"]
+    assert client.post("/gallery/purge", json={"ids": [identifier]}).status_code == 422
+    result = client.post("/gallery/purge", json={"ids": [identifier, "invalid"], "source": source}).json()
+    assert result["results"][0]["ok"] and result["results"][0]["state"] == "purged"
+    assert not result["results"][1]["ok"]
+    assert client.get("/files/purge.png").status_code == 404
+    assert engine.library.trash_items()["items"] == []
+    assert not (engine.library.root / "purge.png.json").exists()
+
+
 def test_mask_controls(rgba):
     base = dict(prompt="change to red", mode="masked", images_b64=[rgba])
-    for mask in [Image.new("L", (256, 256), 0), Image.new("L", (128, 128), 255)]:
-        with pytest.raises(ValueError):
-            q.prepare_inputs(q.ImageRequest(**base, mask_b64=encoded(mask)))
+    assert q.prepare_inputs(q.ImageRequest(**base, mask_b64=encoded(Image.new("L", (256, 256), 0))))[2] is not None
+    with pytest.raises(ValueError):
+        q.prepare_inputs(q.ImageRequest(**base, mask_b64=encoded(Image.new("L", (128, 128), 255))))
     spec = q.ImageRequest(**base, mask_b64=encoded(Image.new("L", (256, 256), 255)))
     prompt, images, mask = q.prepare_inputs(spec)
     assert len(images) == 2 and mask.size == (256, 256)
@@ -158,6 +173,8 @@ def test_saved_rgba_mask_preservation_and_seed(engine, rgba, monkeypatch):
     metadata = json.loads((engine.output / (result["outputs"][0]["name"] + ".json")).read_text())
     assert metadata["seed"] == 42 and metadata["preserve_unmasked"] is True
     assert metadata["dwm_scale"] == q.DWM_DEFAULT_SCALE
+    assert metadata["seconds"] >= 0
+    assert engine.library.gallery()["items"][0]["seconds"] >= 0
     assert not list(engine.output.glob("*.partial"))
 
 
@@ -237,3 +254,12 @@ def test_automatic_enhance_then_render_preserves_provenance(engine, monkeypatch)
     meta = json.loads((engine.output / (result["outputs"][0]["name"] + ".json")).read_text())
     assert meta["prompt"] == "a fox" and meta["effective_prompt"] == "A wide copper fox portrait"
     assert meta["prompt_enhancement"]["task"] == "t2i"
+
+
+@pytest.mark.parametrize("options", [
+    {"prompt":" "}, {"width":257,"height":255}, {"width":4096,"height":4096},
+    {"n":9,"num_inference_steps":301}, {"negative_prompt":"blur"},
+    {"true_cfg_scale":20}, {"dwm_scale":3}, {"reference_resolution":768},
+])
+def test_supported_controls_are_not_rejected_by_app_policy(options):
+    q.ImageRequest(**({"prompt":"a cup"}|options))

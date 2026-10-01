@@ -265,9 +265,7 @@ def test_masked_job_uploads_mask_separately_and_validates_pixels(tmp_path):
     assert fake.prompts[0]["image"]["inputs"]["image"] == "input/uploaded-1.png"
     assert fake.prompts[0]["mask"]["inputs"]["image"] == "input/uploaded-2.png"
 
-    with pytest.raises(ValueError, match="mask is empty"):
-        comfy.ImageRequest(prompt="replace", mode="masked", images_b64=[reference],
-                           mask_b64=data_url(png_data((0, 0, 0, 255))))
+    assert comfy._decode_mask(data_url(png_data((0, 0, 0, 255))), reference)
     with pytest.raises(ValueError, match="same dimensions"):
         comfy.ImageRequest(prompt="replace", mode="masked", images_b64=[reference],
                            mask_b64=data_url(png_data((255, 255, 255, 255), (8, 8))))
@@ -461,24 +459,12 @@ def test_cancel_during_final_poll_sleep_wins_over_timeout(tmp_path):
     assert "error" not in engine.get(job["id"])
 
 
-def test_reference_dimensions_are_checked_before_decode(monkeypatch):
-    class Oversized:
-        format = "PNG"
-        width = 5000
-        height = 4000
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            return False
-
-        def load(self):
-            raise AssertionError("oversized image must not be decoded")
-
-    monkeypatch.setattr(comfy.Image, "open", lambda _: Oversized())
-    with pytest.raises(ValueError, match="16 megapixels"):
-        comfy._decode_reference(data_url())
+def test_large_valid_reference_is_not_rejected_by_app_pixel_cap():
+    raw = io.BytesIO()
+    Image.new("RGBA", (5000, 4000), (0, 0, 0, 255)).save(raw, format="PNG")
+    decoded, _ = comfy._decode_reference(data_url(raw.getvalue()))
+    with Image.open(io.BytesIO(decoded)) as result:
+        assert result.size == (5000, 4000)
 
 
 def test_no_duplicate_publish(configured):
@@ -510,6 +496,27 @@ def test_api_health_and_gallery_basics(configured, monkeypatch):
     assert client.get("/files/saved.png").status_code == 200
 
 
+@pytest.mark.parametrize("source", ["photos", "trash"])
+def test_permanent_delete_api_pair_partial_results_and_required_source(configured, monkeypatch, source):
+    engine, _ = configured
+    monkeypatch.setattr(comfy, "engine", engine)
+    client = TestClient(comfy.app)
+    image = engine.library.publish(Image.new("RGBA", (8, 8)), "purge.png", {"seed": 9})
+    keep = engine.library.publish(Image.new("RGBA", (8, 8)), "keep.png", {"seed": 10})
+    identifier = image["id"]
+    if source == "trash":
+        identifier = engine.library.move_to_trash(identifier)["id"]
+    assert client.post("/gallery/purge", json={"ids": [identifier]}).status_code == 422
+    result = client.post("/gallery/purge", json={"source": source, "ids": [identifier, identifier, "invalid"]}).json()
+    assert len(result["results"]) == 2
+    assert result["results"][0]["ok"] and result["results"][0]["state"] == "purged"
+    assert not result["results"][1]["ok"] and not result["ok"]
+    assert client.get("/files/purge.png").status_code == 404
+    assert engine.library.gallery()["items"][0]["id"] == keep["id"]
+    assert engine.library.trash_items()["items"] == []
+    assert not (engine.library.root / "purge.png.json").exists()
+
+
 def test_health_advertises_only_configured_advanced_modes(tmp_path, monkeypatch):
     basic = comfy.ComfyImageEngine(
         comfy.ComfyConfig.from_mapping(config_mapping(tmp_path), tmp_path / "basic.json"), FakeComfy())
@@ -528,3 +535,24 @@ def test_health_advertises_only_configured_advanced_modes(tmp_path, monkeypatch)
     assert {"transparent_png", "transparent_edit", "subject_extraction", "mask_edit", "annotation_edit"} \
         <= set(health["capabilities"])
     assert health["controls"]["max_references_by_mode"]["masked"] == 1
+
+
+def test_generation_seconds_saved_per_variation_and_exposed_in_gallery(configured, monkeypatch):
+    engine, fake = configured
+    job = engine.submit(comfy.ImageRequest(prompt="one", seed=1, n=2))
+    clock = [10.0]
+    monkeypatch.setattr(comfy.time, "monotonic", lambda: clock[0])
+    original_history = fake.history
+    def history(prompt_id):
+        if len(fake.prompts) == 2:
+            assert engine.get(job["id"])["seconds"] == 2.5
+        clock[0] += 2.5 if len(fake.prompts) == 1 else 3.5
+        return original_history(prompt_id)
+    monkeypatch.setattr(fake, "history", history)
+    run_job(engine, job["id"])
+    items = engine.library.gallery()["items"]
+    assert sorted(item["seconds"] for item in items) == [2.5, 3.5]
+    assert engine.get(job["id"])["seconds"] == 6
+    for item in items:
+        metadata = json.loads((engine.output / (item["name"] + ".json")).read_text())
+        assert metadata["seconds"] == item["seconds"]

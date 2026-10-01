@@ -829,7 +829,7 @@ class Handler(BaseHTTPRequestHandler):
         if origin and urlparse(origin).netloc != self.headers.get("Host"):
             return self._send(403, json.dumps({"detail": "Cross-origin writes are not accepted"}))
         path = urlparse(self.path).path
-        if path in {"/api/images/jobs", "/api/images/enhance", "/api/images/gallery/trash", "/api/images/gallery/restore"} or re.fullmatch(r"/api/images/jobs/img_[a-f0-9]{24}/cancel", path):
+        if path in {"/api/images/jobs", "/api/images/enhance", "/api/images/gallery/trash", "/api/images/gallery/restore", "/api/images/gallery/purge"} or re.fullmatch(r"/api/images/jobs/img_[a-f0-9]{24}/cancel", path):
             try:
                 payload = self._read_json()
                 if not isinstance(payload, dict):

@@ -125,3 +125,94 @@ def test_double_publication_never_overwrites(tmp_path):
     with pytest.raises(FileExistsError):
         sample(library)
     assert (tmp_path / "one.png").read_bytes() == before
+
+
+@pytest.mark.parametrize("source", ["photos", "trash"])
+def test_permanent_delete_removes_only_selected_pair_and_survives_restart(tmp_path, source):
+    library = ImageLibrary(tmp_path)
+    selected = sample(library)
+    keep = sample(library, "keep.png")
+    if source == "photos":
+        result = library.purge_photo(selected["id"])
+        assert library.purge_photo(selected["id"])["state"] == "purged"
+    else:
+        entry = library.move_to_trash(selected["id"])
+        (library.trash / entry["id"] / "unrelated.txt").write_text("keep")
+        result = library.purge_trash(entry["id"])
+        assert (library.trash / entry["id"] / "unrelated.txt").read_text() == "keep"
+    folder = library.trash / result["id"]
+    assert result["state"] == "purged" and result["files"] == {}
+    for parent in (tmp_path, folder):
+        assert not (parent / "one.png").exists()
+        assert not (parent / "one.png.json").exists()
+    restarted = ImageLibrary(tmp_path)
+    assert restarted.gallery()["items"][0]["id"] == keep["id"]
+    assert restarted.gallery()["trash_count"] == 0
+    assert restarted.trash_items()["items"] == []
+    assert restarted.purge_trash(result["id"])["state"] == "purged"
+    with pytest.raises(ValueError, match="cannot be restored"):
+        restarted.restore(result["id"])
+    # A new image with the same name remains visible and can be independently deleted.
+    replacement = sample(restarted)
+    assert restarted.file("one.png").exists()
+    assert restarted.purge_photo(replacement["id"])["id"] != result["id"]
+
+
+def test_interrupted_permanent_delete_resumes_only_recorded_pair(tmp_path, monkeypatch):
+    library = ImageLibrary(tmp_path)
+    entry = library.move_to_trash(sample(library)["id"])
+    real_unlink = Path.unlink
+    def fail_sidecar(path, *args, **kwargs):
+        if path.name == "one.png.json":
+            raise PermissionError("simulated file lock")
+        return real_unlink(path, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", fail_sidecar)
+        with pytest.raises(PermissionError):
+            library.purge_trash(entry["id"])
+    folder = library.trash / entry["id"]
+    assert not (folder / "one.png").exists()
+    assert (folder / "one.png.json").exists()
+    assert json.loads((folder / "entry.json").read_text())["state"] == "purging"
+    recovered = ImageLibrary(tmp_path)
+    assert recovered.recovery_errors == []
+    assert not (folder / "one.png.json").exists()
+    assert recovered.trash_items()["items"] == []
+    assert recovered.purge_trash(entry["id"])["state"] == "purged"
+
+
+def test_permanent_delete_checks_all_digests_before_removing_any_file(tmp_path):
+    library = ImageLibrary(tmp_path)
+    entry = library.move_to_trash(sample(library)["id"])
+    folder = library.trash / entry["id"]
+    original = (folder / "one.png").read_bytes()
+    (folder / "one.png.json").write_text("changed metadata")
+    with pytest.raises(ValueError, match="changed"):
+        library.purge_trash(entry["id"])
+    assert (folder / "one.png").read_bytes() == original
+    assert (folder / "one.png.json").read_text() == "changed metadata"
+    assert json.loads((folder / "entry.json").read_text())["state"] == "trashed"
+
+
+def test_permanent_delete_refuses_restored_tokens_and_redirected_files(tmp_path):
+    library = ImageLibrary(tmp_path)
+    item = sample(library)
+    entry = library.move_to_trash(item["id"])
+    library.restore(entry["id"])
+    with pytest.raises(ValueError):
+        library.purge_trash(entry["id"])
+    assert library.file("one.png").exists()
+    for value in ("../outside", item["id"], "one.png"):
+        with pytest.raises(ValueError):
+            library.purge_trash(value)
+    entry = library.move_to_trash(item["id"])
+    folder = library.trash / entry["id"]
+    sidecar = folder / "one.png.json"
+    sidecar.unlink()
+    outside = tmp_path / "keep.txt"
+    outside.write_text("outside data")
+    sidecar.symlink_to(outside)
+    with pytest.raises(ValueError):
+        library.purge_trash(entry["id"])
+    assert outside.read_text() == "outside data"
+    assert (folder / "one.png").exists()

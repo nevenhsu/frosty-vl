@@ -16,6 +16,7 @@ import base64
 import copy
 import io
 import json
+import math
 import os
 import queue
 import secrets
@@ -27,7 +28,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -38,8 +39,7 @@ from .image_library import ImageLibrary, TYPES
 
 
 MAX_BODY = 36_000_000
-MAX_REFERENCES = 10
-MAX_REFERENCE_BYTES = 12_000_000
+MAX_REFERENCES = 16
 ADVANCED_MODES = frozenset({"transparent", "extract", "masked", "annotate"})
 _MISSING = object()
 
@@ -145,6 +145,7 @@ class WorkflowSpec:
     path: Path
     template: dict[str, Any]
     bindings: dict[str, list[tuple[str, str]]]
+    references_encoding: str = "native"
 
 
 @dataclass(frozen=True)
@@ -156,6 +157,10 @@ class ComfyConfig:
     request_timeout: float = 30.0
     poll_interval: float = 0.25
     poll_timeout: float = 86_400.0
+    sampling: dict[str, Any] | None = None
+    profile: str = "base"
+    model_name: str = "ComfyUI"
+    max_references: int | None = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any], source: str | os.PathLike[str] | None = None) -> "ComfyConfig":
@@ -218,7 +223,14 @@ class ComfyConfig:
                 raise ComfyConfigError(f"{mode} workflow must bind at least one reference image explicitly")
             if mode == "masked" and not bindings.get("mask"):
                 raise ComfyConfigError("masked workflow must bind a mask image explicitly")
-            workflows[mode] = WorkflowSpec(resolved, copy.deepcopy(dict(template)), bindings)
+            encoding = workflow_paths[mode].get("references_encoding", "native") if isinstance(workflow_paths[mode], Mapping) else "native"
+            if encoding not in {"native", "json"}:
+                raise ComfyConfigError("references_encoding must be native or json")
+            if encoding == "json":
+                reference_bindings = next((bindings[key] for key in ("references", "reference", "images", "image") if bindings.get(key)), [])
+                if len(reference_bindings) != 1:
+                    raise ComfyConfigError("JSON references must use exactly one explicit input binding")
+            workflows[mode] = WorkflowSpec(resolved, copy.deepcopy(dict(template)), bindings, encoding)
         supported_modes_raw = raw.get("supported_modes") or []
         if not isinstance(supported_modes_raw, list) or not all(isinstance(item, str) for item in supported_modes_raw):
             raise ComfyConfigError("supported_modes must be a list of mode names")
@@ -233,7 +245,27 @@ class ComfyConfig:
         poll_timeout = float(raw.get("poll_timeout", 86_400.0))
         if timeout <= 0 or poll_interval <= 0 or poll_timeout <= 0:
             raise ComfyConfigError("ComfyUI timeouts must be positive")
-        return cls(url.rstrip("/"), output_dir, workflows, supported_modes, timeout, poll_interval, poll_timeout)
+        sampling = raw.get("sampling")
+        if sampling is not None:
+            required = {"default_steps", "guidance", "negative_prompt"}
+            if not isinstance(sampling, Mapping) or set(sampling) not in (required, required | {"steps"}):
+                raise ComfyConfigError("sampling must define default_steps, guidance and negative_prompt; steps is optional")
+            if type(sampling["default_steps"]) is not int or sampling["default_steps"] < 1:
+                raise ComfyConfigError("sampling default_steps must be a positive integer")
+            # Older profiles may include suggested counts. They are not a whitelist.
+            guidance = sampling["guidance"]
+            if (type(guidance) not in (int, float) or not math.isfinite(guidance) or
+                    type(sampling["negative_prompt"]) is not bool):
+                raise ComfyConfigError("Invalid sampling guidance or negative_prompt setting")
+            sampling = copy.deepcopy(dict(sampling))
+        profile, model_name = raw.get("profile", "base"), raw.get("model_name", "ComfyUI")
+        if not all(isinstance(value, str) and value.strip() for value in (profile, model_name)):
+            raise ComfyConfigError("profile and model_name must be non-empty strings")
+        max_references = raw.get("max_references")
+        if max_references is not None and (type(max_references) is not int or not 1 <= max_references <= MAX_REFERENCES):
+            raise ComfyConfigError("max_references must be an integer between 1 and 16")
+        return cls(url.rstrip("/"), output_dir, workflows, supported_modes, timeout, poll_interval,
+                   poll_timeout, sampling, profile, model_name, max_references)
 
 
 def load_config(path: str | os.PathLike[str] | None = None) -> ComfyConfig | None:
@@ -246,6 +278,9 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ComfyConfig | Non
         raw = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise ComfyConfigError(f"Cannot read FVL_COMFY_IMAGE_CONFIG {config_path}: {exc}") from exc
+    output_dir = os.environ.get("FVL_COMFY_IMAGE_OUTPUT_DIR")
+    if output_dir and isinstance(raw, dict):
+        raw["output_dir"] = output_dir
     return ComfyConfig.from_mapping(raw, config_path)
 
 
@@ -351,18 +386,18 @@ def _error_text(value: Any) -> str:
 
 class ImageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
-    prompt: str = Field(min_length=1, max_length=12000)
+    prompt: str
     mode: str = "auto"
     images_b64: list[str] = Field(default_factory=list, max_length=MAX_REFERENCES)
     mask_b64: str | None = None
     preserve_unmasked: bool = True
-    negative_prompt: str = Field(default="", max_length=4000)
+    negative_prompt: str = ""
     seed: int | None = Field(default=None, ge=0, le=2**63 - 1)
-    steps: int = Field(default=30, alias="num_inference_steps", ge=1, le=200)
-    width: int = Field(default=1024, ge=64, le=4096)
-    height: int = Field(default=1024, ge=64, le=4096)
-    guidance: float = Field(default=1.0, alias="true_cfg_scale", ge=0.0, le=30.0)
-    n: int = Field(default=1, ge=1, le=8)
+    steps: int = Field(default=30, alias="num_inference_steps", ge=1)
+    width: int = Field(default=1024, ge=16)
+    height: int = Field(default=1024, ge=16)
+    guidance: float = Field(default=1.0, alias="true_cfg_scale", allow_inf_nan=False)
+    n: int = Field(default=1, ge=1)
 
     @model_validator(mode="after")
     def validate_request(self):
@@ -382,10 +417,6 @@ class ImageRequest(BaseModel):
             raise ValueError("Masks are accepted only in masked mode")
         if self.mask_b64 and len(self.images_b64) > MAX_REFERENCES - 1:
             raise ValueError(f"Use up to {MAX_REFERENCES - 1} references plus one mask")
-        if self.width % 8 or self.height % 8:
-            raise ValueError("Width and height must be multiples of 8")
-        if sum(len(item) for item in self.images_b64) + len(self.mask_b64 or "") > MAX_REFERENCES * MAX_REFERENCE_BYTES * 2:
-            raise ValueError("Combined reference images are too large")
         if self.mode == "masked":
             _decode_mask(self.mask_b64, self.images_b64[0])
         return self
@@ -394,8 +425,6 @@ class ImageRequest(BaseModel):
 def _decode_reference(value: str) -> tuple[bytes, str]:
     if not isinstance(value, str):
         raise ValueError("Reference image must be base64 text")
-    if len(value) > MAX_REFERENCE_BYTES:
-        raise ValueError("A reference image exceeds 12 MB")
     head, encoded = (value.split(",", 1) if "," in value else ("", value))
     try:
         data = base64.b64decode(encoded, validate=True)
@@ -409,8 +438,6 @@ def _decode_reference(value: str) -> tuple[bytes, str]:
         with Image.open(io.BytesIO(data)) as image:
             if image.format not in {"PNG", "JPEG", "WEBP"}:
                 raise ValueError("Use PNG, JPEG, or WebP references")
-            if image.width * image.height > 16_000_000:
-                raise ValueError("Reference images must be at most 16 megapixels")
             image.load()
             normalized = io.BytesIO()
             image.convert("RGBA").save(normalized, format="PNG")
@@ -429,8 +456,6 @@ def _decode_mask(value: str, reference_value: str) -> bytes:
         if source.size != reference_size:
             raise ValueError("The mask must have the same dimensions as the first reference")
         mask = source.convert("L")
-    if mask.getextrema()[1] == 0:
-        raise ValueError("The mask is empty; paint the area to edit in white")
     normalized = io.BytesIO()
     mask.save(normalized, format="PNG")
     return normalized.getvalue()
@@ -548,6 +573,7 @@ class ComfyImageEngine:
             result = copy.deepcopy(self.jobs[job_id])
             if not private:
                 result.pop("_spec", None)
+                result.pop("_started_at", None)
             return result
 
     def submit(self, spec: ImageRequest) -> dict[str, Any]:
@@ -555,6 +581,7 @@ class ComfyImageEngine:
             spec = ImageRequest.model_validate(spec)
         if not self.ready:
             raise HTTPException(503, self.error or "ComfyUI image adapter is not configured")
+        spec = self._apply_sampling(spec)
         if spec.mode in ADVANCED_MODES and spec.mode not in self.config.supported_modes:
             raise ComfyConfigError(f"Mode {spec.mode} is not enabled by this ComfyUI configuration")
         with self.lock:
@@ -630,7 +657,8 @@ class ComfyImageEngine:
         return []
 
     def _inject(self, workflow: dict[str, Any], spec: ImageRequest, bindings: Mapping[str, list[tuple[str, str]]],
-                seed: int, references: list[str], mask: str | None = None) -> None:
+                seed: int, references: list[str], mask: str | None = None,
+                references_encoding: str = "native") -> None:
         values: dict[str, Any] = {"prompt": _effective_prompt(spec), "negative_prompt": spec.negative_prompt,
                                   "seed": seed, "steps": spec.steps, "width": spec.width,
                                   "height": spec.height, "guidance": spec.guidance}
@@ -662,7 +690,8 @@ class ComfyImageEngine:
             # nodes and preserves all source ordering information.
             if len(targets) == 1:
                 node, input_name = targets[0]
-                workflow[node]["inputs"][input_name] = references if len(references) > 1 else references[0]
+                workflow[node]["inputs"][input_name] = (json.dumps(references) if references_encoding == "json"
+                                                       else references if len(references) > 1 else references[0])
             elif len(targets) != len(references):
                 raise ComfyConfigError("Reference binding count does not match uploaded references")
             else:
@@ -679,6 +708,7 @@ class ComfyImageEngine:
 
     def build_workflow(self, spec: ImageRequest, seed: int, references: list[str] | None = None,
                        mask: str | None = None) -> dict[str, Any]:
+        spec = self._apply_sampling(spec)
         if spec.mode in ADVANCED_MODES and (not self.config or spec.mode not in self.config.supported_modes):
             raise ComfyConfigError(f"Mode {spec.mode} is not enabled by this ComfyUI configuration")
         mode = _workflow_key(spec)
@@ -686,8 +716,21 @@ class ComfyImageEngine:
             raise ComfyConfigError(f"No configured workflow for mode {mode}")
         workflow_spec = self.config.workflows[mode]
         workflow = copy.deepcopy(workflow_spec.template)
-        self._inject(workflow, spec, workflow_spec.bindings, seed, references or [], mask)
+        self._inject(workflow, spec, workflow_spec.bindings, seed, references or [], mask,
+                     workflow_spec.references_encoding)
         return workflow
+
+    def _apply_sampling(self, spec: ImageRequest) -> ImageRequest:
+        sampling = self.config.sampling if self.config else None
+        if sampling is None:
+            return spec
+        if "steps" not in spec.model_fields_set:
+            spec = spec.model_copy(update={"steps": sampling["default_steps"]})
+        if spec.guidance != sampling["guidance"]:
+            raise ComfyConfigError(f"This sampling profile requires guidance {sampling['guidance']}")
+        if spec.negative_prompt and not sampling["negative_prompt"]:
+            raise ComfyConfigError("This sampling profile does not support a negative prompt")
+        return spec
 
     def _upload_references(self, job_id: str, spec: ImageRequest) -> list[str]:
         uploaded: list[str] = []
@@ -718,7 +761,7 @@ class ComfyImageEngine:
         job = self.get(job_id, private=True)
         spec = _job_spec(job)
         started = time.monotonic()
-        self.update(job_id, status="running", stage="Uploading references")
+        self.update(job_id, status="running", stage="Uploading references", _started_at=started)
         references = self._upload_references(job_id, spec) if spec.images_b64 else []
         mask = self._upload_mask(job_id, spec)
         for index in range(spec.n):
@@ -729,10 +772,11 @@ class ComfyImageEngine:
             seed = (job["seed"] + index) % (2**63)
             workflow = self.build_workflow(spec, seed, references, mask)
             self.update(job_id, stage=f"Queueing image {index + 1} of {spec.n}")
+            image_started = started if index == 0 else time.monotonic()
             response = self.client.prompt(workflow)
             prompt_id = str(response["prompt_id"])
             self.update(job_id, prompt_ids=self.get(job_id).get("prompt_ids", []) + [prompt_id], stage="Waiting for ComfyUI")
-            result = self._wait_prompt(job_id, prompt_id, spec, seed, index, started)
+            result = self._wait_prompt(job_id, prompt_id, spec, seed, index, image_started)
             if result == "cancelled":
                 return
             if result == "error":
@@ -780,7 +824,7 @@ class ComfyImageEngine:
                     self.update(job_id, status="cancelled", stage="Cancelled")
                     return "cancelled"
                 try:
-                    self._publish_outputs(job_id, spec, seed, prompt_id, outputs, variation)
+                    self._publish_outputs(job_id, spec, seed, prompt_id, outputs, variation, round(time.monotonic() - started, 2))
                 except JobCancelled:
                     self.update(job_id, status="cancelled", stage="Cancelled")
                     return "cancelled"
@@ -792,7 +836,7 @@ class ComfyImageEngine:
                 # Older Comfy versions omit status.completed once outputs are
                 # available; success plus outputs is still terminal.
                 try:
-                    self._publish_outputs(job_id, spec, seed, prompt_id, outputs, variation)
+                    self._publish_outputs(job_id, spec, seed, prompt_id, outputs, variation, round(time.monotonic() - started, 2))
                 except JobCancelled:
                     self.update(job_id, status="cancelled", stage="Cancelled")
                     return "cancelled"
@@ -807,7 +851,7 @@ class ComfyImageEngine:
         return "error"
 
     def _publish_outputs(self, job_id: str, spec: ImageRequest, seed: int, prompt_id: str,
-                         outputs: Mapping[str, Any], variation: int) -> None:
+                         outputs: Mapping[str, Any], variation: int, seconds: float | None = None) -> None:
         if not isinstance(outputs, Mapping):
             raise ComfyError("ComfyUI history returned invalid outputs")
         descriptors: list[tuple[str, Mapping[str, Any]]] = []
@@ -854,8 +898,9 @@ class ComfyImageEngine:
                 "seed": seed, "mode": spec.mode,
                 "width": image.width, "height": image.height, "num_inference_steps": spec.steps,
                 "guidance": spec.guidance, "reference_count": len(spec.images_b64),
-                "engine_id": "comfyui", "engine_label": "ComfyUI", "comfy_prompt_id": prompt_id,
-                "variation": variation, "created_at": time.time(),
+                "engine_id": "comfyui", "engine_label": self.config.model_name,
+                "profile": self.config.profile, "comfy_prompt_id": prompt_id,
+                "variation": variation, "created_at": time.time(), "seconds": seconds,
                 "preserve_unmasked": spec.preserve_unmasked if spec.mode == "masked" else None,
             }
             with self.lock:
@@ -866,7 +911,7 @@ class ComfyImageEngine:
                           "seed": seed, "width": image.width, "height": image.height}
                 published.add(key)
                 self.update(job_id, outputs=self.get(job_id).get("outputs", []) + [output],
-                            published=sorted(published), seconds=round(time.monotonic() - self.get(job_id)["created_at"], 2))
+                            published=sorted(published), seconds=round(time.monotonic() - self.jobs[job_id].get("_started_at", time.monotonic()), 2))
 
 
 def _job_spec(job: Mapping[str, Any]) -> ImageRequest:
@@ -913,6 +958,11 @@ def health():
     def reference_limit(workflow_name: str) -> int:
         if not engine.config or workflow_name not in engine.config.workflows:
             return 0
+        workflow = engine.config.workflows[workflow_name]
+        if any(node["class_type"] == "FrostyLoadReferenceImages" for node in workflow.template.values()):
+            return MAX_REFERENCES - (workflow_name == "masked")
+        if engine.config.max_references is not None:
+            return min(engine.config.max_references, MAX_REFERENCES - (workflow_name == "masked"))
         bindings = engine.config.workflows[workflow_name].bindings
         for key in ("references", "reference", "images", "image"):
             if bindings.get(key):
@@ -938,8 +988,17 @@ def health():
                 "resolutions": [384, 512, 1024, 2048],
                 "resolution_default": 384,
                 "edit_reference_resolution": 384,
-                "steps": {"min": 1, "max": 200, "default": 20},
-                "guidance": {"min": 0, "max": 30, "default": 1, "step": 0.5}}
+                "steps": {"min": 1, "default": 20, "step": 1},
+                "guidance": {"default": 1, "step": 0.5}}
+    if engine.config and engine.config.profile == "turbo":
+        controls["resolution_default"] = 512
+        controls["edit_reference_resolution"] = 512
+    if engine.config and engine.config.sampling:
+        sampling = engine.config.sampling
+        controls["steps"] = {"min": 1, "default": sampling["default_steps"], "step": 1}
+        guidance = sampling["guidance"]
+        controls["guidance"] = {"min": guidance, "max": guidance, "default": guidance, "step": 1}
+        controls["negative_prompt"] = sampling["negative_prompt"]
     ready = engine.ready
     upstream_error = engine.error
     if ready and isinstance(engine.client, ComfyClient):
@@ -950,7 +1009,8 @@ def health():
             upstream_error = "ComfyUI unavailable: " + str(exc)
     return {"status": "error" if upstream_error else "ok" if ready else "loading",
             "ready": ready, "loading": bool(engine.worker and engine.worker.is_alive()),
-            "error": upstream_error, "model": "ComfyUI", "capabilities": capabilities,
+            "error": upstream_error, "model": engine.config.model_name if engine.config else "ComfyUI",
+            "profile": engine.config.profile if engine.config else "base", "capabilities": capabilities,
             "controls": controls,
             "active_job": next((key for key, value in engine.jobs.items() if value["status"] in {"running", "cancelling"}), None),
             "queued": engine.pending.qsize()}
@@ -977,6 +1037,10 @@ def cancel(job_id: str):
 class LibrarySelection(BaseModel):
     model_config = ConfigDict(extra="forbid")
     ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class PurgeSelection(LibrarySelection):
+    source: Literal["photos", "trash"]
 
 
 @app.get("/gallery")
@@ -1009,6 +1073,12 @@ def trash_images(selection: LibrarySelection):
 @app.post("/gallery/restore")
 def restore_images(selection: LibrarySelection):
     return library_action(selection, engine.library.restore)
+
+
+@app.post("/gallery/purge")
+def purge_images(selection: PurgeSelection):
+    action = engine.library.purge_photo if selection.source == "photos" else engine.library.purge_trash
+    return library_action(selection, action)
 
 
 @app.get("/files/{name}")

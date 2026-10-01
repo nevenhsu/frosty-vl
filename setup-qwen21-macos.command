@@ -6,25 +6,40 @@ umask 022
 
 bundle_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 install_root=${FVL_QWEN21_HOME:-$(dirname "$bundle_dir")}
-comfyui_dir=$install_root/ComfyUI
+comfyui_dir=${FVL_COMFYUI_DIR:-$install_root/ComfyUI}
 download_dir=$install_root/qwen21-downloads
-model_dir=$download_dir/models
+model_dir=${FVL_QWEN21_MODEL_DIR:-${FVL_MODEL_DIR:-$download_dir/models}}
 adapter_venv=$bundle_dir/.venv-comfy
 comfyui_launcher=$install_root/start-comfyui-qwen21.command
 check_only=0
+profile=${FVL_QWEN21_PROFILE:-turbo}
+cli_profile=""
 
-case "${1:-}" in
-  "") ;;
-  --check-only) check_only=1 ;;
-  -h|--help)
-    echo "Usage: /bin/bash setup-qwen21-macos.command [--check-only]"
-    echo "Install root: $install_root"
-    echo "Complete models and an existing ComfyUI installation are verified and skipped."
-    exit 0
-    ;;
-  *) echo "Unknown option: $1" >&2; exit 2 ;;
-esac
-[[ $# -le 1 ]] || { echo "Too many options." >&2; exit 2; }
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --check-only) check_only=1 ;;
+    --turbo|--base)
+      requested_profile=${1#--}
+      if [[ -n "$cli_profile" && "$cli_profile" != "$requested_profile" ]]; then
+        echo "Choose only one profile: --base or --turbo." >&2
+        exit 2
+      fi
+      cli_profile=$requested_profile
+      ;;
+    -h|--help)
+      echo "Usage: /bin/bash setup-qwen21-macos.command [--base|--turbo] [--check-only]"
+      echo "Profile: ${cli_profile:-$profile} (FVL_QWEN21_PROFILE may set the default)"
+      echo "Install root: $install_root"
+      echo "ComfyUI: $comfyui_dir"
+      echo "Models: $model_dir"
+      echo "Complete models and an existing ComfyUI installation are verified and skipped."
+      exit 0
+      ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+[[ -z "$cli_profile" ]] || profile=$cli_profile
 
 fail() {
   echo >&2
@@ -33,20 +48,16 @@ fail() {
 }
 
 [[ $(uname -s) == Darwin ]] || fail "This setup supports macOS only."
+[[ "$profile" == base || "$profile" == turbo ]] || fail "FVL_QWEN21_PROFILE must be base or turbo."
 [[ $(uname -m) == arm64 ]] || fail "Run in a native Apple Silicon terminal, not Rosetta."
 [[ $(id -u) -ne 0 ]] || fail "Run as a normal user, without sudo."
-for tool in curl git shasum stat df awk xcode-select xcrun cmp cp mv chmod mkdir mktemp; do
+for tool in curl git shasum stat df awk xcode-select xcrun cmp cp mv chmod mkdir mktemp diff; do
   command -v "$tool" >/dev/null 2>&1 || fail "Required tool not found: $tool"
 done
 xcode-select -p >/dev/null
 xcrun --find clang >/dev/null
 
-mkdir -p "$download_dir"
 lock_dir=$download_dir/.setup-lock
-if ! mkdir "$lock_dir" 2>/dev/null; then
-  fail "Another setup is running, or a stale lock exists: $lock_dir"
-fi
-printf '%s\n' "$$" >"$lock_dir/pid"
 cleanup() {
   local owner=""
   if [[ -f "$lock_dir/pid" ]]; then IFS= read -r owner <"$lock_dir/pid" || true; fi
@@ -55,7 +66,14 @@ cleanup() {
     rmdir "$lock_dir" 2>/dev/null || true
   fi
 }
-trap cleanup EXIT
+if [[ $check_only -eq 0 ]]; then
+  mkdir -p "$download_dir"
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    fail "Another setup is running, or a stale lock exists: $lock_dir"
+  fi
+  printf '%s\n' "$$" >"$lock_dir/pid"
+  trap cleanup EXIT
+fi
 trap 'echo "Setup interrupted; completed files and .part downloads were preserved." >&2; exit 130' INT
 trap 'echo "Setup stopped; completed files and .part downloads were preserved." >&2; exit 143' TERM HUP
 
@@ -75,8 +93,23 @@ model_url=(
   "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/e83187db03c1bf47495c2e283582761e7c26bcf9/text_encoders/qwen3vl_8b_int8_convrot.safetensors?download=true"
   "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/8150226f50722886a275fa08e7b1fdf961732502/vae/qwen_image_2.1_vae_bf16.safetensors?download=true"
 )
+if [[ "$profile" == turbo ]]; then
+  model_rel+=("loras/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors")
+  model_size+=(679604800)
+  model_sha+=("bafb91d0047df3f9b8a5a850b0c967f051164314d8aad778dfa34d9c24ec345b")
+  model_url+=("https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo/resolve/bb26a0f38e5fe6c124aaccc9187a87eed5d9ed13/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors?download=true")
+fi
+model_count=${#model_rel[@]}
 
-file_size() { stat -f '%z' "$1"; }
+default_config=$bundle_dir/config/comfyui-image.json
+default_engines=$bundle_dir/config/comfyui-image-engines.json
+if [[ "$profile" == turbo ]]; then
+  default_config=$bundle_dir/config/comfyui-image-turbo.json
+  default_engines=$bundle_dir/config/comfyui-image-turbo-engines.json
+fi
+config_path=${FVL_COMFY_IMAGE_CONFIG:-$default_config}
+
+file_size() { stat -L -f '%z' "$1"; }
 sha_matches() {
   local actual
   actual=$(shasum -a 256 <"$1") || return 1
@@ -95,8 +128,8 @@ verify_or_download_model() {
   target=$model_dir/${model_rel[$index]}
   part=$target.part
   echo
-  echo "[$((index + 1))/3] ${model_rel[$index]##*/}"
-  if [[ -f "$target" && ! -L "$target" ]]; then
+  echo "[$((index + 1))/$model_count] ${model_rel[$index]##*/}"
+  if [[ -f "$target" ]]; then
     actual_size=$(file_size "$target")
     if [[ "$actual_size" == "${model_size[$index]}" ]]; then
       echo "Size matches; verifying local SHA-256..."
@@ -106,10 +139,10 @@ verify_or_download_model() {
       fi
     fi
     [[ $check_only -eq 1 ]] && return 2
-    preserve_unverified "$target"
+    fail "Existing model failed verification: $target. No replacement or download was performed; check the file before re-running setup."
   elif [[ -e "$target" || -L "$target" ]]; then
     [[ $check_only -eq 1 ]] && return 2
-    preserve_unverified "$target"
+    fail "Existing model path is not a readable regular file: $target. It was left unchanged."
   fi
   [[ $check_only -eq 0 ]] || return 2
 
@@ -133,7 +166,7 @@ verify_or_download_model() {
       echo "Resuming partial download at $actual_size / ${model_size[$index]} bytes."
     fi
   fi
-  available_kb=$(df -Pk "$download_dir" | awk 'NR == 2 {print $4}')
+  available_kb=$(df -Pk "${target%/*}" | awk 'NR == 2 {print $4}')
   [[ "$available_kb" =~ ^[0-9]+$ ]] || fail "Could not determine free disk space."
   actual_size=0
   [[ -f "$part" ]] && actual_size=$(file_size "$part")
@@ -162,49 +195,73 @@ echo "Install root: $install_root"
 echo "ComfyUI: $comfyui_dir"
 echo "Models:  $model_dir"
 model_errors=0
-for index in 0 1 2; do
+for ((index=0; index<model_count; index++)); do
   verify_or_download_model "$index" || model_errors=1
 done
+
+check_turbo_node_bundle() {
+  local source=$bundle_dir/comfyui/frosty_viggle_turbo_v021
+  local installed=$comfyui_dir/custom_nodes/frosty_viggle_turbo_v021
+  local name
+  [[ -f "$source/__init__.py" && -f "$source/viggle_turbo.py" ]] || fail "Turbo node bundle source is incomplete: $source"
+  for name in __init__.py runtime.py references.py schedules.py viggle_turbo.py LICENSE NOTICE UPSTREAM.md; do
+    [[ -f "$source/$name" ]] || continue
+    [[ -f "$installed/$name" ]] || fail "Turbo node bundle is missing: $installed/$name"
+    cmp -s "$source/$name" "$installed/$name" || fail "Turbo node bundle identity mismatch: $installed/$name"
+  done
+}
+
 if [[ $check_only -eq 1 ]]; then
   [[ $model_errors -eq 0 ]] || fail "One or more models are missing or unverified."
   [[ -x "$comfyui_dir/.venv/bin/python" ]] || fail "ComfyUI environment is missing: $comfyui_dir"
   [[ -f "$comfyui_dir/custom_nodes/ComfyUI-GGUF/__init__.py" ]] || fail "ComfyUI-GGUF is missing."
+  if [[ "$profile" == turbo ]]; then
+    check_turbo_node_bundle
+  fi
   [[ -x "$adapter_venv/bin/python" ]] || fail "Frosty adapter environment is missing."
   "$adapter_venv/bin/python" -c 'import fastapi, PIL, uvicorn'
+  [[ -f "$config_path" ]] || fail "Profile adapter config is missing: $config_path"
   echo "All portable runtime components are present."
   exit 0
 fi
 
-if [[ -x /opt/homebrew/opt/python@3.12/bin/python3.12 ]]; then
-  python312=/opt/homebrew/opt/python@3.12/bin/python3.12
-elif command -v python3.12 >/dev/null 2>&1; then
-  python312=$(command -v python3.12)
-else
-  brew_bin=$(command -v brew || true)
-  [[ -n "$brew_bin" ]] || fail "Python 3.12 is missing. Install Homebrew, then re-run setup."
-  echo "Installing Python 3.12 with Homebrew..."
-  "$brew_bin" install python@3.12
-  python312=$($brew_bin --prefix python@3.12)/bin/python3.12
-fi
-"$python312" -c 'import platform; assert platform.machine() == "arm64"'
+find_python312() {
+  if [[ -x /opt/homebrew/opt/python@3.12/bin/python3.12 ]]; then
+    python312=/opt/homebrew/opt/python@3.12/bin/python3.12
+  elif command -v python3.12 >/dev/null 2>&1; then
+    python312=$(command -v python3.12)
+  else
+    brew_bin=$(command -v brew || true)
+    [[ -n "$brew_bin" ]] || fail "Python 3.12 is missing. Install Homebrew, then re-run setup."
+    echo "Installing Python 3.12 with Homebrew..."
+    "$brew_bin" install python@3.12
+    python312=$($brew_bin --prefix python@3.12)/bin/python3.12
+  fi
+  "$python312" -c 'import platform; assert platform.machine() == "arm64"'
+}
 
 comfy_commit=b0f4b7b294ce482a2e071d9d762c133d38c7aa07
 gguf_commit=f912d5e5c25921e41eae2c0131eeb4d350e7c165
 if [[ -e "$comfyui_dir" || -L "$comfyui_dir" ]]; then
-  [[ -d "$comfyui_dir/.git" && ! -L "$comfyui_dir" ]] || fail "Existing ComfyUI path is not a normal Git checkout: $comfyui_dir"
-  echo "Existing ComfyUI checkout found; skipping clone."
+  [[ -f "$comfyui_dir/main.py" ]] || fail "Existing ComfyUI path has no main.py: $comfyui_dir. It was left unchanged."
+  [[ -x "$comfyui_dir/.venv/bin/python" ]] || fail "Existing ComfyUI has no usable .venv/bin/python: $comfyui_dir. Its installation was left unchanged."
+  echo "Existing ComfyUI installation found; reusing its source, environment and settings."
+  comfy_existing=1
 else
   echo "Installing ComfyUI into the package runtime..."
   git clone https://github.com/Comfy-Org/ComfyUI.git "$comfyui_dir"
   git -C "$comfyui_dir" checkout --detach "$comfy_commit"
+  comfy_existing=0
 fi
 
 if [[ ! -x "$comfyui_dir/.venv/bin/python" ]]; then
   echo "Creating ComfyUI Python environment..."
+  find_python312
   "$python312" -m venv "$comfyui_dir/.venv"
 fi
 comfy_python=$comfyui_dir/.venv/bin/python
 if ! "$comfy_python" -c 'import torch, yaml, safetensors' >/dev/null 2>&1; then
+  [[ $comfy_existing -eq 0 ]] || fail "Existing ComfyUI environment is missing required imports (torch, yaml, safetensors). Its dependencies were left unchanged."
   echo "Installing ComfyUI dependencies..."
   "$comfy_python" -m pip install --upgrade pip
   "$comfy_python" -m pip install -r "$comfyui_dir/requirements.txt" -r "$comfyui_dir/manager_requirements.txt"
@@ -212,27 +269,72 @@ fi
 
 gguf_dir=$comfyui_dir/custom_nodes/ComfyUI-GGUF
 if [[ -e "$gguf_dir" || -L "$gguf_dir" ]]; then
-  [[ -d "$gguf_dir/.git" && ! -L "$gguf_dir" ]] || fail "Existing ComfyUI-GGUF path is not a normal Git checkout: $gguf_dir"
+  [[ -f "$gguf_dir/__init__.py" ]] || fail "Existing ComfyUI-GGUF node is incomplete: $gguf_dir. It was left unchanged."
   echo "Existing ComfyUI-GGUF node found; skipping clone."
+  gguf_existing=1
 else
   echo "Installing ComfyUI-GGUF..."
   mkdir -p "$comfyui_dir/custom_nodes"
   git clone https://github.com/leejet/ComfyUI-GGUF.git "$gguf_dir"
   git -C "$gguf_dir" checkout --detach "$gguf_commit"
+  gguf_existing=0
 fi
 if ! "$comfy_python" -c 'import gguf' >/dev/null 2>&1; then
+  [[ $gguf_existing -eq 0 ]] || fail "Existing ComfyUI-GGUF dependencies are unavailable. Its environment was left unchanged."
   echo "Installing ComfyUI-GGUF dependencies..."
   "$comfy_python" -m pip install -r "$gguf_dir/requirements.txt"
 fi
-"$comfy_python" -m pip check
+if [[ $comfy_existing -eq 0 ]]; then
+  "$comfy_python" -m pip check
+fi
 
 if [[ ! -x "$adapter_venv/bin/python" ]]; then
   echo "Creating Frosty adapter environment..."
-  "$python312" -m venv "$adapter_venv"
+  "$comfy_python" -m venv "$adapter_venv"
 fi
 if ! "$adapter_venv/bin/python" -c 'import fastapi, PIL, uvicorn' >/dev/null 2>&1; then
   echo "Installing Frosty adapter dependencies..."
   "$adapter_venv/bin/python" -m pip install -r "$bundle_dir/requirements-comfy.txt"
+fi
+
+install_turbo_node_bundle() {
+  local source=$bundle_dir/comfyui/frosty_viggle_turbo_v021
+  local custom_nodes=$comfyui_dir/custom_nodes
+  local installed=$custom_nodes/frosty_viggle_turbo_v021
+  local temp backup name bundle_current
+  [[ -f "$source/__init__.py" && -f "$source/viggle_turbo.py" ]] || fail "Turbo node bundle source is incomplete: $source"
+  mkdir -p "$custom_nodes"
+  if [[ -d "$installed" && ! -L "$installed" ]]; then
+    bundle_current=1
+    for name in __init__.py runtime.py references.py schedules.py viggle_turbo.py LICENSE NOTICE UPSTREAM.md; do
+      [[ -f "$source/$name" ]] || continue
+      if [[ ! -f "$installed/$name" ]] || ! cmp -s "$source/$name" "$installed/$name"; then
+        bundle_current=0
+        break
+      fi
+    done
+    if ((bundle_current == 1)); then
+      echo "Existing Frosty Viggle Turbo node bundle is current; skipping copy."
+      return 0
+    fi
+    mkdir -p "$download_dir/node-backups"
+    backup=$download_dir/node-backups/frosty_viggle_turbo_v021.$(date '+%Y%m%d-%H%M%S').$$
+    mv "$installed" "$backup"
+    echo "Backed up previous Frosty Viggle Turbo node bundle: $backup"
+  elif [[ -e "$installed" || -L "$installed" ]]; then
+    mkdir -p "$download_dir/node-backups"
+    backup=$download_dir/node-backups/frosty_viggle_turbo_v021.$(date '+%Y%m%d-%H%M%S').$$
+    mv "$installed" "$backup"
+    echo "Backed up previous Frosty Viggle Turbo node bundle: $backup"
+  fi
+  temp=$custom_nodes/.frosty_viggle_turbo_v021.$$
+  mkdir "$temp"
+  cp -R "$source"/. "$temp"/
+  mv "$temp" "$installed"
+}
+
+if [[ "$profile" == turbo ]]; then
+  install_turbo_node_bundle
 fi
 
 launcher_temp=$download_dir/.start-comfyui-qwen21.command.$$
@@ -243,26 +345,35 @@ if [[ -f "$comfyui_launcher" ]] && ! cmp -s "$launcher_temp" "$comfyui_launcher"
   cp -p "$comfyui_launcher" "$launcher_backup"
   echo "Backed up previous ComfyUI launcher: $launcher_backup"
 fi
-mv -f "$launcher_temp" "$comfyui_launcher"
-chmod 755 "$comfyui_launcher"
+if [[ -f "$comfyui_launcher" ]] && cmp -s "$launcher_temp" "$comfyui_launcher"; then
+  rm -f "$launcher_temp"
+  chmod 755 "$comfyui_launcher"
+  echo "Existing Frosty ComfyUI launcher is current; skipping copy."
+else
+  mv -f "$launcher_temp" "$comfyui_launcher"
+  chmod 755 "$comfyui_launcher"
+fi
 
 echo "Checking MPS and portable Frosty configuration..."
 "$comfy_python" -c 'import torch; assert torch.backends.mps.is_available(), "MPS is unavailable"; x=torch.ones((2,2),device="mps",dtype=torch.float16); torch.mps.synchronize(); assert (x@x).isfinite().all()'
-model_config=$download_dir/comfyui_model_paths.yaml
+model_config=$(mktemp "$download_dir/.frosty-model-paths.XXXXXX")
+trap 'rm -f "$model_config"; cleanup' EXIT
 {
   echo "qwen21_local:"
   printf '  base_path: "%s"\n' "${model_dir//\"/\\\"}"
   echo "  diffusion_models: diffusion_models"
   echo "  text_encoders: text_encoders"
   echo "  vae: vae"
+  echo "  loras: loras"
 } >"$model_config"
 (
   cd "$comfyui_dir"
-  PYTORCH_ENABLE_MPS_FALLBACK=1 "$comfy_python" - "$model_config" <<'PY'
+  PYTORCH_ENABLE_MPS_FALLBACK=1 "$comfy_python" - "$model_config" "$profile" <<'PY'
 import asyncio
 import sys
 
 model_config = sys.argv[1]
+profile = sys.argv[2]
 sys.argv = [
     "probe", "--extra-model-paths-config", model_config, "--disable-api-nodes",
     "--fp16-unet", "--cpu-vae", "--fp32-vae", "--cache-none",
@@ -279,21 +390,30 @@ required = {
     "EmptyLatentImage", "LoadImage", "QwenImage21Cache", "KSampler",
     "VAEDecodeTiled", "PreviewImage",
 }
+if profile == "turbo":
+    required.update({"FrostyViggleTurboLora", "FrostyViggleTurboSigmas", "BasicGuider",
+                     "RandomNoise", "KSamplerSelect", "SamplerCustomAdvanced", "FrostyLoadReferenceImages"})
 missing = required - set(nodes.NODE_CLASS_MAPPINGS)
 if missing:
     raise RuntimeError("Missing required ComfyUI nodes: " + ", ".join(sorted(missing)))
 print("Required ComfyUI nodes: passed")
 PY
 )
-FVL_COMFY_IMAGE_CONFIG="$bundle_dir/config/comfyui-image.json" PYTHONPATH="$bundle_dir" \
+FVL_COMFY_IMAGE_CONFIG="$config_path" PYTHONPATH="$bundle_dir" \
   "$adapter_venv/bin/python" -c 'from server.comfy_image_serve import load_config; c=load_config(); assert set(c.workflows)=={"t2i","edit","masked"}; assert set(c.supported_modes)=={"transparent","extract","masked","annotate"}'
 /bin/bash -n "$bundle_dir/start-frosty-qwen21"
 /bin/bash -n "$comfyui_launcher"
+chmod 755 "$bundle_dir/start-frosty-qwen21" "$bundle_dir/scripts/start-comfy-image.sh"
 
 echo
 echo "Setup complete. No full image generation was run."
 echo "From now on, open Qwen Image Studio with:"
-echo "  \"$bundle_dir/start-frosty-qwen21\""
+if [[ "$profile" == turbo ]]; then
+  echo "  \"$bundle_dir/start-frosty-qwen21\""
+else
+  echo "  \"$bundle_dir/start-frosty-qwen21\" --base"
+fi
 echo "ComfyUI-only launcher: $comfyui_launcher"
+echo "Profile: $profile"
 echo "Studio URL: http://127.0.0.1:8890/image"
 echo "Generated images: $comfyui_dir/output/Qwen21"

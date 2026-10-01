@@ -13,6 +13,7 @@ import urllib.request
 
 import pytest
 from PIL import Image
+from pydantic import ValidationError
 
 # Optional companion dependencies should not prevent the render-only test suite.
 pytest.importorskip('mcp')
@@ -79,15 +80,16 @@ def test_protocol_image_reference_tools_and_recoverable_gallery(studio_bridge):
             assert 'already finished clips are retained' in resource.contents[0].text
             status=await client.call_tool('frosty_status')
             assert status.structured_content['workspaces']=={'image':True,'video':True}
-            spec={'prompt':'compose','images':[item['id']]*10,'n':2,'width':512,'height':512,'dwm_scale':0.75,
-                  'reference_resolution':256,'use_kv_cache':False,'num_inference_steps':20}
+            spec={'prompt':'','images':[item['id']]*11,'mask':item['id'],'n':9,'width':4096,'height':4096,'dwm_scale':3,
+                  'true_cfg_scale':20,'reference_resolution':768,'use_kv_cache':False,'num_inference_steps':301}
             result=await client.call_tool('frosty_generate_image',{'request':spec})
             assert not result.is_error
             payload=calls[-1][2]
-            assert len(payload['images_b64'])==10 and payload['dwm_scale']==.75 and payload['n']==2
+            assert len(payload['images_b64'])==11 and payload['dwm_scale']==3 and payload['n']==9
+            assert payload['width']==4096 and payload['height']==4096 and payload['num_inference_steps']==301
+            assert payload['true_cfg_scale']==20 and payload['reference_resolution']==768
             assert payload['images_b64'][0].startswith('data:image/png;base64,')
-            too_many=await client.call_tool('frosty_generate_image',{'request':dict(spec,images=[item['id']]*11)})
-            assert too_many.is_error
+            assert payload['mask_b64'].startswith('data:image/png;base64,')
             # Omitting DWM keeps the user's backend default, rather than sending zero.
             await client.call_tool('frosty_enhance_prompt',{'request':{'prompt':'expand this'}})
             assert calls[-1][1]=='/enhance' and 'dwm_scale' not in calls[-1][2]
@@ -106,6 +108,18 @@ def test_protocol_image_reference_tools_and_recoverable_gallery(studio_bridge):
             gallery=await client.call_tool('frosty_gallery',{'workspace':'image','search':'blue','limit':1})
             assert gallery.structured_content['total']==1
     asyncio.run(run())
+
+
+def test_image_spec_keeps_positive_and_finite_boundary_safety():
+    spec=ImageSpec(prompt='',images=['image_'+'a'*32]*17,width=4096,height=4096,
+                   num_inference_steps=301,n=9,reference_resolution=768,
+                   true_cfg_scale=20,dwm_scale=3)
+    assert spec.prompt=='' and len(spec.images)==17 and spec.num_inference_steps==301
+    for field in ('width','height','num_inference_steps','n','reference_resolution'):
+        with pytest.raises(ValidationError): ImageSpec(prompt='x',**{field:0})
+    with pytest.raises(ValidationError): ImageSpec(prompt='x',seed=-1)
+    with pytest.raises(ValidationError): ImageSpec(prompt='x',true_cfg_scale=float('nan'))
+    with pytest.raises(ValidationError): ImageSpec(prompt='x',dwm_scale=float('inf'))
 
 
 def test_real_stdio_legacy_client_and_video_lifecycle(video_studio):

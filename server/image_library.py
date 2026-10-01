@@ -1,8 +1,8 @@
 """Image publication and recoverable Trash; owned by the image-engine process.
 
 The journal is written before moving either member of an image/sidecar pair.
-Interrupted moves resume at startup; collisions are never overwritten. This
-module deliberately has no purge operation and no GPU dependencies.
+Interrupted moves and confirmed purges resume at startup; collisions are never
+overwritten. Permanent deletion removes only the journal's recorded file pair.
 """
 from __future__ import annotations
 
@@ -63,7 +63,7 @@ class ImageLibrary:
     trash_name = ".frosty-trash"
     file_prefix = "/api/images/files/"
     metadata_fields = ("prompt", "effective_prompt", "seed", "mode", "width", "height",
-                       "num_inference_steps", "dwm_scale", "reference_count", "preserve_unmasked")
+                       "num_inference_steps", "seconds", "dwm_scale", "reference_count", "preserve_unmasked")
 
     def _name(self, name):
         return _name(name, self.media_types)
@@ -84,6 +84,11 @@ class ImageLibrary:
             if entry["state"] in {"moving", "restoring"}:
                 try:
                     self._finish(entry)
+                except (OSError, ValueError) as exc:
+                    self.recovery_errors.append({"id": entry["id"], "error": str(exc)})
+            elif entry["state"] == "purging":
+                try:
+                    self._finish_purge(entry)
                 except (OSError, ValueError) as exc:
                     self.recovery_errors.append({"id": entry["id"], "error": str(exc)})
 
@@ -115,9 +120,16 @@ class ImageLibrary:
         name = self._name(entry["name"])
         if entry["id"] != folder.name or entry["asset_id"] != self._id(name):
             raise ValueError("Invalid Trash journal identity")
-        if entry["state"] not in {"moving", "trashed", "restoring", "restored"}:
+        if entry["state"] not in {"moving", "trashed", "restoring", "restored", "purging", "purged"}:
             raise ValueError("Invalid Trash journal state")
-        if set(entry["files"]) not in ({name}, {name, name + ".json"}):
+        files = entry["files"]
+        if not isinstance(files, dict):
+            raise ValueError("Invalid Trash file pair")
+        if entry["state"] == "purged":
+            valid_pair = not files
+        else:
+            valid_pair = set(files) in ({name}, {name, name + ".json"})
+        if not valid_pair:
             raise ValueError("Invalid Trash file pair")
         if any(not re.fullmatch(r"[a-f0-9]{64}", value) for value in entry["files"].values()):
             raise ValueError("Invalid Trash file digest")
@@ -136,7 +148,7 @@ class ImageLibrary:
         return rows
 
     def _hidden(self):
-        return {entry["name"] for entry in self._entries() if entry["state"] != "restored"}
+        return {entry["name"] for entry in self._entries() if entry["state"] not in {"restored", "purged"}}
 
     def _finish(self, entry):
         folder = self._folder(entry["id"])
@@ -194,7 +206,7 @@ class ImageLibrary:
                     continue
             items.sort(key=lambda item: (item["created_at"], item["name"]), reverse=True)
             return dict(ok=True, count=len(items), items=items,
-                        trash_count=sum(e["state"] != "restored" for e in self._entries()))
+                        trash_count=sum(e["state"] not in {"restored", "purged"} for e in self._entries()))
 
     def file(self, name):
         with self.lock:
@@ -210,7 +222,7 @@ class ImageLibrary:
         with self.lock:
             items = []
             for entry in self._entries():
-                if entry["state"] == "restored":
+                if entry["state"] in {"restored", "purged"}:
                     continue
                 items.append({key: entry[key] for key in ("id", "asset_id", "name", "state", "deleted_at")})
             return dict(ok=True, items=sorted(items, key=lambda item: item["deleted_at"], reverse=True))
@@ -219,10 +231,10 @@ class ImageLibrary:
         with self.lock:
             if not re.fullmatch(self.id_prefix + r"_[a-f0-9]{32}", identifier):
                 raise ValueError("Invalid image ID")
-            previous = next((e for e in self._entries() if e["asset_id"] == identifier and e["state"] != "restored"), None)
+            previous = next((e for e in self._entries() if e["asset_id"] == identifier and e["state"] not in {"restored", "purged"}), None)
             if previous:
-                if previous["state"] == "restoring":
-                    raise ValueError("Restore is pending; finish restoring this item first")
+                if previous["state"] in {"restoring", "purging"}:
+                    raise ValueError("Restore or permanent deletion is pending; finish it first")
                 return self._finish(previous) if previous["state"] == "moving" else previous
             item = next((i for i in self.gallery()["items"] if i["id"] == identifier), None)
             if not item:
@@ -245,9 +257,55 @@ class ImageLibrary:
             entry = self._read(folder)
             if entry["state"] == "restored":
                 return entry
+            if entry["state"] in {"purging", "purged"}:
+                raise ValueError("Permanently deleted items cannot be restored")
             entry["state"] = "restoring"
             _write(self._path("entry.json", folder), entry)
             return self._finish(entry)
+
+    def _validate_purge_files(self, entry, allow_missing=False):
+        folder = self._folder(entry["id"])
+        for name, digest in entry["files"].items():
+            path = self._path(name, folder)
+            if not path.exists() and allow_missing:
+                continue
+            if not path.is_file() or _digest(path) != digest:
+                raise ValueError("Image changed or is missing; files were kept")
+
+    def _finish_purge(self, entry):
+        self._validate_purge_files(entry, allow_missing=True)
+        folder = self._folder(entry["id"])
+        for name in entry["files"]:
+            self._path(name, folder).unlink(missing_ok=True)
+        entry["state"] = "purged"
+        entry["files"] = {}
+        _write(self._path("entry.json", folder), entry)
+        return entry
+
+    def purge_trash(self, token):
+        with self.lock:
+            folder = self._folder(token)
+            entry = self._read(folder)
+            if entry["state"] == "purged":
+                return entry
+            if entry["state"] not in {"trashed", "purging"}:
+                raise ValueError("Only fully trashed items can be permanently deleted")
+            if entry["state"] == "trashed":
+                self._validate_purge_files(entry)
+                entry["state"] = "purging"
+                _write(self._path("entry.json", folder), entry)
+            return self._finish_purge(entry)
+
+    def purge_photo(self, identifier):
+        with self.lock:
+            if not any(item["id"] == identifier for item in self.gallery()["items"]):
+                previous = next((entry for entry in self._entries()
+                                 if entry["asset_id"] == identifier and entry["state"] == "purged"), None)
+                if previous:
+                    return previous
+                raise FileNotFoundError("Image is not in the collection; use its Trash ID to delete from Trash")
+            entry = self.move_to_trash(identifier)
+            return self.purge_trash(entry["id"])
 
     def publish(self, image, name, metadata):
         with self.lock:

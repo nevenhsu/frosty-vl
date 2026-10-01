@@ -1,0 +1,108 @@
+{
+  "comfyui_url": "http://127.0.0.1:8188",
+  "output_dir": "../../ComfyUI/output/Qwen21",
+  "supported_modes": [
+    "transparent",
+    "extract",
+    "masked",
+    "annotate"
+  ],
+  "workflows": {
+    "t2i": {
+      "path": "../workflows/qwen21_t2i_turbo_api.json",
+      "bindings": {
+        "prompt": [
+          "452",
+          "prompt"
+        ],
+        "negative_prompt": [
+          "452",
+          "negative_prompt"
+        ],
+        "seed": [
+          "483",
+          "noise_seed"
+        ],
+        "steps": [
+          "481",
+          "steps"
+        ],
+        "width": [
+          "456",
+          "width"
+        ],
+        "height": [
+          "456",
+          "height"
+        ],
+        "output": "461"
+      }
+    },
+    "edit": {
+      "path": "../workflows/qwen21_edit_turbo_api.json",
+      "bindings": {
+        "prompt": [
+          "474",
+          "prompt"
+        ],
+        "negative_prompt": [
+          "474",
+          "negative_prompt"
+        ],
+        "seed": [
+          "483",
+          "noise_seed"
+        ],
+        "steps": [
+          "481",
+          "steps"
+        ],
+        "output": "461",
+        "references": [
+          "460",
+          "filenames"
+        ]
+      },
+      "references_encoding": "json"
+    },
+    "masked": {
+      "path": "../workflows/qwen21_masked_turbo_api.json",
+      "bindings": {
+        "prompt": [
+          "474",
+          "prompt"
+        ],
+        "negative_prompt": [
+          "474",
+          "negative_prompt"
+        ],
+        "seed": [
+          "483",
+          "noise_seed"
+        ],
+        "steps": [
+          "481",
+          "steps"
+        ],
+        "mask": [
+          "475",
+          "image"
+        ],
+        "output": "461",
+        "references": [
+          "460",
+          "filenames"
+        ]
+      },
+      "references_encoding": "json"
+    }
+  },
+  "profile": "turbo",
+  "model_name": "Qwen Image 2.1 \u00b7 Viggle Turbo v0.2.1 r128",
+  "sampling": {
+    "default_steps": 6,
+    "guidance": 1.0,
+    "negative_prompt": false
+  },
+  "max_references": 16
+}

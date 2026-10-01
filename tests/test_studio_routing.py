@@ -45,13 +45,14 @@ def test_image_and_video_routes_coexist_with_video_default(studio):
     assert calls[-1][1] == "/gallery"
 
 
-def test_library_post_proxy_and_origin_check(studio):
+@pytest.mark.parametrize("route", ["trash", "purge"])
+def test_library_post_proxy_and_origin_check(studio, route):
     _, base, calls = studio
     body = json.dumps({"ids": ["image_" + "a" * 32]}).encode()
-    request = urllib.request.Request(base + "/api/images/gallery/trash", data=body,
+    request = urllib.request.Request(base + "/api/images/gallery/" + route, data=body,
                                      headers={"Content-Type": "application/json", "Origin": base})
     assert urllib.request.urlopen(request).status == 200
-    assert calls[-1][1] == "/gallery/trash" and calls[-1][3].endswith(":19002")
+    assert calls[-1][1] == "/gallery/" + route and calls[-1][3].endswith(":19002")
     request.add_header("Origin", "http://unrelated.invalid")
     with pytest.raises(urllib.error.HTTPError) as error:
         urllib.request.urlopen(request)

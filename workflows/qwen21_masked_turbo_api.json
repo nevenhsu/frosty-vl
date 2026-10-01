@@ -1,0 +1,249 @@
+{
+  "451": {
+    "inputs": {
+      "unet_name": "qwen-image-2.1-Q4_K_M.gguf"
+    },
+    "class_type": "UnetLoaderGGUF",
+    "_meta": {
+      "title": "01 主模型 | Unet Loader (GGUF)"
+    }
+  },
+  "453": {
+    "inputs": {
+      "clip_name": "qwen3vl_8b_int8_convrot.safetensors",
+      "type": "qwen_image",
+      "device": "cpu"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "02 INT8 文字編碼器 | CPU"
+    }
+  },
+  "454": {
+    "inputs": {
+      "vae_name": "qwen_image_2.1_vae_bf16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "03 Qwen-Image-2.1 專用 VAE"
+    }
+  },
+  "460": {
+    "class_type": "FrostyLoadReferenceImages",
+    "inputs": {
+      "filenames": "[\"example.png\"]"
+    }
+  },
+  "475": {
+    "inputs": {
+      "image": "mask.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "05 載入遮罩 | Frosty 自動上傳"
+    }
+  },
+  "474": {
+    "inputs": {
+      "clip": [
+        "453",
+        0
+      ],
+      "prompt": "將圖片的背景改成乾淨的淺灰色攝影棚背景，保留主體的外觀、顏色、位置與構圖，讓光線和陰影自然一致。",
+      "negative_prompt": "",
+      "resolution": 512,
+      "vae": [
+        "454",
+        0
+      ],
+      "images.image_1": [
+        "460",
+        0
+      ],
+      "images.image_2": [
+        "460",
+        1
+      ],
+      "images.image_3": [
+        "460",
+        2
+      ],
+      "images.image_4": [
+        "460",
+        3
+      ],
+      "images.image_5": [
+        "460",
+        4
+      ],
+      "images.image_6": [
+        "460",
+        5
+      ],
+      "images.image_7": [
+        "460",
+        6
+      ],
+      "images.image_8": [
+        "460",
+        7
+      ],
+      "images.image_9": [
+        "460",
+        8
+      ],
+      "images.image_10": [
+        "460",
+        9
+      ],
+      "images.image_11": [
+        "460",
+        10
+      ],
+      "images.image_12": [
+        "460",
+        11
+      ],
+      "images.image_13": [
+        "460",
+        12
+      ],
+      "images.image_14": [
+        "460",
+        13
+      ],
+      "images.image_15": [
+        "460",
+        14
+      ],
+      "images.image_16": [
+        "475",
+        0
+      ]
+    },
+    "class_type": "TextEncodeQwenImage21",
+    "_meta": {
+      "title": "05 圖片編輯 | 修改指令 / resolution=512"
+    }
+  },
+  "469": {
+    "inputs": {
+      "device": "off",
+      "dtype": "default",
+      "model": [
+        "451",
+        0
+      ]
+    },
+    "class_type": "QwenImage21Cache",
+    "_meta": {
+      "title": "06 編輯 KV 快取 | 首次設 off"
+    }
+  },
+  "457": {
+    "inputs": {
+      "samples": [
+        "458",
+        0
+      ],
+      "vae": [
+        "454",
+        0
+      ],
+      "tile_size": 256,
+      "overlap": 64,
+      "temporal_size": 64,
+      "temporal_overlap": 8
+    },
+    "class_type": "VAEDecodeTiled",
+    "_meta": {
+      "title": "08 VAE 分塊解碼"
+    }
+  },
+  "461": {
+    "inputs": {
+      "images": [
+        "457",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "09 暫存結果 | Frosty 取回後保存"
+    }
+  },
+  "480": {
+    "class_type": "FrostyViggleTurboLora",
+    "inputs": {
+      "model": [
+        "469",
+        0
+      ],
+      "lora_name": "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors",
+      "strength": 1.0
+    }
+  },
+  "481": {
+    "class_type": "FrostyViggleTurboSigmas",
+    "inputs": {
+      "latent": [
+        "474",
+        2
+      ],
+      "steps": 6
+    }
+  },
+  "482": {
+    "class_type": "BasicGuider",
+    "inputs": {
+      "model": [
+        "480",
+        0
+      ],
+      "conditioning": [
+        "474",
+        0
+      ]
+    }
+  },
+  "483": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": 42
+    }
+  },
+  "484": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "euler"
+    }
+  },
+  "458": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": [
+        "483",
+        0
+      ],
+      "guider": [
+        "482",
+        0
+      ],
+      "sampler": [
+        "484",
+        0
+      ],
+      "sigmas": [
+        "481",
+        0
+      ],
+      "latent_image": [
+        "474",
+        2
+      ]
+    },
+    "_meta": {
+      "title": "Viggle Turbo · editable steps · no CFG"
+    }
+  }
+}

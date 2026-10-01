@@ -157,12 +157,11 @@ Arguments for `frosty_generate_video`, replacing the asset ID with one returned 
 {"request":{"prompt":"Slow dolly forward, boats sway gently, quiet water","image":"image_<returned-id>","duration_seconds":5,"request_id":"harbor-shot-001"}}
 ```
 
-Image requests support up to ten **ordered** references, or nine plus `mask`.
-Inputs accept image gallery IDs, PNG/JPEG/WebP data URLs, or allowed local paths.
-Each reference is limited to 9 MB and 16 megapixels; the combined request must fit
-36 MB. Resize large reference sets first. Output batches support `n: 1–4` subject
-to the backend. Omit `dwm_scale` to preserve the engine's configured default.
-The image engine remains authoritative about mode-specific controls and dimensions.
+Image requests accept ordered references and an optional mask. Inputs accept image
+gallery IDs, PNG/JPEG/WebP data URLs, or allowed local paths. The companion keeps
+transport and image-format safety checks while the image engine remains
+authoritative about reference counts, dimensions, steps, output batches, CFG and
+DWM controls. Omit `dwm_scale` to preserve the engine's configured default.
 
 Local file reads are disabled by default. Opt in with `FROSTY_MCP_INPUT_DIRS`, a
 list of allowed directories separated by `:` on macOS/Linux or `;` on Windows.

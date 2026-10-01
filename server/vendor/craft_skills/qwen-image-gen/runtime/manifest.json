@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "id": "qwen-image-gen",
+  "version": "0.2.1",
+  "instructionFiles": [
+    "SKILL.md",
+    "references/rewriting.md",
+    "references/tested-behavior.md"
+  ]
+}

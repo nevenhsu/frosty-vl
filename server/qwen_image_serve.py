@@ -34,8 +34,8 @@ MODEL_DIR = Path(os.environ.get("FVL_IMAGE_MODEL_DIR", "models/Qwen-Image-2.1"))
 OUT_DIR = Path(os.environ.get("FVL_IMAGE_OUTPUT_DIR", "outputs/images")).resolve()
 QUANTIZATION = os.environ.get("FVL_IMAGE_QUANTIZATION", "nf4")
 DWM_DEFAULT_SCALE = float(os.environ.get("FVL_IMAGE_DWM_DEFAULT_SCALE", "0.0"))
-if not 0.0 <= DWM_DEFAULT_SCALE <= 2.0:
-    raise ValueError("FVL_IMAGE_DWM_DEFAULT_SCALE must be between 0 and 2")
+if not math.isfinite(DWM_DEFAULT_SCALE):
+    raise ValueError("FVL_IMAGE_DWM_DEFAULT_SCALE must be finite")
 DWM_STATUS = {"enabled": False, "mode": "clean", "weights_modified": False}
 MAX_BODY = 36_000_000
 CAPABILITIES = ["text_to_image", "image_edit", "multi_reference", "transparent_png",
@@ -44,35 +44,29 @@ CAPABILITIES = ["text_to_image", "image_edit", "multi_reference", "transparent_p
 
 class ImageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    prompt: str = Field(min_length=1, max_length=12000)
+    prompt: str
     mode: Literal["auto", "generate", "edit", "transparent", "extract", "masked", "annotate"] = "auto"
-    images_b64: list[str] = Field(default_factory=list, max_length=10)
+    images_b64: list[str] = Field(default_factory=list)
     mask_b64: str | None = None
     preserve_unmasked: bool = True
-    width: int = Field(default=1024, ge=256, le=4096)
-    height: int = Field(default=1024, ge=256, le=4096)
-    num_inference_steps: int = Field(default=40, ge=1, le=80)
+    width: int = Field(default=1024, ge=32)
+    height: int = Field(default=1024, ge=32)
+    num_inference_steps: int = Field(default=40, ge=1)
     seed: int | None = Field(default=None, ge=0, le=2**63 - 1)
-    negative_prompt: str = Field(default="", max_length=4000)
-    true_cfg_scale: float = Field(default=1.0, ge=1.0, le=10.0)
+    negative_prompt: str = ""
+    true_cfg_scale: float = Field(default=1.0, allow_inf_nan=False)
     use_kv_cache: bool = True
-    reference_resolution: Literal[256, 512, 1024] = 512
-    n: int = Field(default=1, ge=1, le=4)
+    reference_resolution: int = Field(default=512, ge=32)
+    n: int = Field(default=1, ge=1)
     enhance_prompt: bool = False
     auto_aspect_ratio: bool = False
-    dwm_scale: float = Field(default=DWM_DEFAULT_SCALE, ge=0.0, le=2.0)
+    dwm_scale: float = Field(default=DWM_DEFAULT_SCALE, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def validate_options(self):
         if self.mode == "auto":
             self.mode = "edit" if self.images_b64 else "generate"
         self.prompt = self.prompt.strip()
-        if not self.prompt:
-            raise ValueError("Enter an image description or editing instruction")
-        if self.width % 32 or self.height % 32:
-            raise ValueError("Width and height must be multiples of 32")
-        if self.width * self.height > 4_500_000:
-            raise ValueError("Maximum output area is 4.5 megapixels")
         if self.auto_aspect_ratio and not self.enhance_prompt:
             raise ValueError("Automatic aspect ratio requires automatic prompt enhancement")
         if self.mode in {"edit", "extract", "masked", "annotate"} and not self.images_b64:
@@ -83,27 +77,15 @@ class ImageRequest(BaseModel):
             raise ValueError("Paint or upload a mask for a masked edit")
         if self.mask_b64 and self.mode != "masked":
             raise ValueError("Masks are accepted only in masked-edit mode")
-        if self.mask_b64 and len(self.images_b64) > 9:
-            raise ValueError("Use up to nine references plus one mask")
-        if self.negative_prompt.strip() and self.true_cfg_scale <= 1:
-            raise ValueError("A negative prompt requires guidance above 1")
-        if self.true_cfg_scale > 1 and not self.negative_prompt.strip():
-            raise ValueError("Guidance above 1 requires a negative prompt")
-        if sum(map(len, self.images_b64)) + len(self.mask_b64 or "") > 32_000_000:
-            raise ValueError("Combined reference images exceed 32 MB; resize them first")
         return self
 
 
 def decode_image(encoded: str) -> Image.Image:
-    if len(encoded) > 12_000_000:
-        raise ValueError("An uploaded image exceeds 12 MB")
     try:
         raw = base64.b64decode(encoded.split(",", 1)[-1], validate=True)
         with Image.open(io.BytesIO(raw)) as source:
             if source.format not in {"PNG", "JPEG", "WEBP"}:
                 raise ValueError("Use PNG, JPEG, or WebP")
-            if source.width * source.height > 16_000_000:
-                raise ValueError("Reference images must be at most 16 megapixels")
             source.load()
             return ImageOps.exif_transpose(source).convert("RGBA")
     except (OSError, ValueError, Image.DecompressionBombError) as exc:
@@ -112,8 +94,6 @@ def decode_image(encoded: str) -> Image.Image:
 
 def prepare_inputs(spec: ImageRequest):
     images = [decode_image(value) for value in spec.images_b64]
-    if sum(image.width * image.height for image in images) > 40_000_000:
-        raise ValueError("Combined references exceed 40 megapixels")
     prompt = spec.prompt
     mask = None
     if spec.mode == "transparent":
@@ -124,8 +104,6 @@ def prepare_inputs(spec: ImageRequest):
         mask = decode_image(spec.mask_b64).convert("L")
         if mask.size != images[0].size:
             raise ValueError("The mask must have the same dimensions as the first reference")
-        if mask.getextrema()[1] == 0:
-            raise ValueError("The mask is empty; paint the area to edit in white")
         images.append(mask.convert("RGBA"))
         prompt = ("Edit the first image in the region marked white in the last image (the black-and-white edit mask). "
                   "Preserve the other regions and remove any mask markings from the result. " + prompt)
@@ -320,8 +298,8 @@ class ImageEngine:
                         pass
                 if ratio:
                     area = spec.width * spec.height
-                    changes.update(width=max(256, min(4096, int(math.sqrt(area*ratio)/32)*32)),
-                                   height=max(256, min(4096, int(math.sqrt(area/ratio)/32)*32)))
+                    changes.update(width=max(32, int(math.sqrt(area*ratio)/32)*32),
+                                   height=max(32, int(math.sqrt(area/ratio)/32)*32))
             spec = ImageRequest.model_validate(spec.model_dump() | changes)
             prepared = prepare_inputs(spec)
         if self.pipe is None:
@@ -343,6 +321,7 @@ class ImageEngine:
                             completed_steps=index * spec.num_inference_steps + step + 1)
                 return callback_kwargs
 
+            image_started = started if index == 0 else time.monotonic()
             seed = (spec.seed + index) % (2**63)
             with request_scale(spec.dwm_scale):
                 result = self.pipe(prompt=prompt, image=images or None, width=spec.width, height=spec.height,
@@ -361,6 +340,7 @@ class ImageEngine:
             metadata = dict(prompt=original_prompt, effective_prompt=prompt, seed=seed, mode=spec.mode,
                             prompt_enhancement=self.get(job_id).get("enhancement"),
                             engine_id="qwen-image-2.1", engine_label="Qwen Image 2.1", created_at=time.time(),
+                            seconds=round(time.monotonic() - image_started, 2),
                             width=result.width, height=result.height, format="RGBA PNG", reference_count=len(spec.images_b64),
                             num_inference_steps=spec.num_inference_steps, quantization=QUANTIZATION,
                             true_cfg_scale=spec.true_cfg_scale, use_kv_cache=spec.use_kv_cache,
@@ -405,9 +385,9 @@ def health():
     return dict(status="error" if engine.error else "loading" if engine.loading else "ok",
                 ready=engine.ready, loading=engine.loading, error=engine.error,
                 model=MODEL_ID, quantization=QUANTIZATION, capabilities=CAPABILITIES,
-                controls={"max_references": 10, "resolutions": [512, 1024, 2048],
+                controls={"max_references": None, "resolutions": [512, 1024, 2048],
                           "resolution_default": 1024,
-                          "steps": {"min": 1, "max": 80, "default": 40},
+                          "steps": {"min": 1, "default": 40, "step": 1},
                           "kv_cache": True, "reference_resolution": True},
                 dwm=DWM_STATUS, dwm_default_scale=DWM_DEFAULT_SCALE,
                 prompt_enhancement=qwen_prompt_enhance.available(MODEL_DIR),
@@ -453,6 +433,10 @@ class LibrarySelection(BaseModel):
     ids: list[str] = Field(min_length=1, max_length=100)
 
 
+class PurgeSelection(LibrarySelection):
+    source: Literal["photos", "trash"]
+
+
 @app.get("/gallery")
 def gallery():
     return engine.library.gallery()
@@ -483,6 +467,12 @@ def trash_images(selection: LibrarySelection):
 @app.post("/gallery/restore")
 def restore_images(selection: LibrarySelection):
     return library_action(selection, engine.library.restore)
+
+
+@app.post("/gallery/purge")
+def purge_images(selection: PurgeSelection):
+    action = engine.library.purge_photo if selection.source == "photos" else engine.library.purge_trash
+    return library_action(selection, action)
 
 
 @app.get("/files/{name}")

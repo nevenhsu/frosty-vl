@@ -2,7 +2,46 @@
 set -euo pipefail
 
 bundle_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-config_path=${FVL_COMFY_IMAGE_CONFIG:-$bundle_dir/config/comfyui-image.json}
+profile=${FVL_QWEN21_PROFILE:-turbo}
+cli_profile=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --turbo|--base)
+      requested_profile=${1#--}
+      if [[ -n "$cli_profile" && "$cli_profile" != "$requested_profile" ]]; then
+        echo "Choose only one profile: --base or --turbo." >&2
+        exit 2
+      fi
+      cli_profile=$requested_profile
+      ;;
+    -h|--help)
+      echo "Usage: $0 [--base|--turbo]"
+      echo "Profile: ${cli_profile:-$profile} (FVL_QWEN21_PROFILE may set the default)"
+      exit 0
+      ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+[[ -z "$cli_profile" ]] || profile=$cli_profile
+if [[ "$profile" != base && "$profile" != turbo ]]; then
+  echo "FVL_QWEN21_PROFILE must be base or turbo." >&2
+  exit 1
+fi
+
+default_config=$bundle_dir/config/comfyui-image.json
+default_engines=$bundle_dir/config/comfyui-image-engines.json
+if [[ "$profile" == turbo ]]; then
+  default_config=$bundle_dir/config/comfyui-image-turbo.json
+  default_engines=$bundle_dir/config/comfyui-image-turbo-engines.json
+fi
+config_path=${FVL_COMFY_IMAGE_CONFIG:-$default_config}
+if [[ -z "${FVL_COMFY_IMAGE_OUTPUT_DIR:-}" && -z "${FVL_COMFY_IMAGE_CONFIG:-}" ]]; then
+  install_root=${FVL_QWEN21_HOME:-$(dirname "$bundle_dir")}
+  comfyui_dir=${FVL_COMFYUI_DIR:-$install_root/ComfyUI}
+  export FVL_COMFY_IMAGE_OUTPUT_DIR=$comfyui_dir/output/Qwen21
+fi
 python_bin=${FVL_COMFY_PYTHON:-$bundle_dir/.venv-comfy/bin/python}
 
 if [[ ! -f "$config_path" ]]; then
@@ -12,12 +51,13 @@ if [[ ! -f "$config_path" ]]; then
 fi
 if [[ ! -x "$python_bin" ]]; then
   echo "Missing ComfyUI adapter Python: $python_bin" >&2
-  echo "Run $bundle_dir/start-qwen21-image.command to create the adapter environment." >&2
+  echo "Run $bundle_dir/setup-qwen21-macos.command to create the adapter environment." >&2
   exit 1
 fi
 
 export FVL_COMFY_IMAGE_CONFIG=$config_path
-export FVL_ENGINES_FILE=${FVL_ENGINES_FILE:-$bundle_dir/config/comfyui-image-engines.json}
+export FVL_QWEN21_PROFILE=$profile
+export FVL_ENGINES_FILE=${FVL_ENGINES_FILE:-$default_engines}
 export FVL_UI_HOST=${FVL_UI_HOST:-127.0.0.1}
 export FVL_UI_PORT=${FVL_UI_PORT:-8890}
 

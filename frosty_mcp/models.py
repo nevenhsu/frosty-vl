@@ -1,30 +1,30 @@
 """Agent-facing schemas. The render engine validates its own final payload."""
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
 
 Workspace = Literal['image', 'video']
 
 
 class ImageSpec(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    prompt: str = Field(min_length=1, max_length=12000)
+    prompt: str
     mode: Literal['auto', 'generate', 'edit', 'transparent', 'extract', 'masked', 'annotate'] = 'auto'
-    images: list[str] = Field(default_factory=list, max_length=10,
+    images: list[str] = Field(default_factory=list,
         description='Ordered image gallery IDs, PNG/JPEG/WebP data URLs, or files inside configured input directories.')
-    mask: str | None = Field(default=None, description='Mask image reference; white edits, black preserves. Uses one of ten input slots.')
+    mask: str | None = Field(default=None, description='Mask image reference; white edits, black preserves.')
     preserve_unmasked: bool | None = None
-    width: int | None = Field(default=None, ge=256, le=4096)
-    height: int | None = Field(default=None, ge=256, le=4096)
-    num_inference_steps: int | None = Field(default=None, ge=1, le=80)
+    width: int | None = Field(default=None, ge=1)
+    height: int | None = Field(default=None, ge=1)
+    num_inference_steps: int | None = Field(default=None, ge=1)
     seed: int | None = Field(default=None, ge=0, le=2**63-1)
-    negative_prompt: str | None = Field(default=None, max_length=4000)
-    true_cfg_scale: float | None = Field(default=None, ge=1, le=10)
+    negative_prompt: str | None = None
+    true_cfg_scale: FiniteFloat | None = None
     use_kv_cache: bool | None = None
-    reference_resolution: Literal[256, 512, 1024] | None = None
-    n: int | None = Field(default=None, ge=1, le=4)
+    reference_resolution: int | None = Field(default=None, ge=1)
+    n: int | None = Field(default=None, ge=1)
     enhance_prompt: bool | None = None
     auto_aspect_ratio: bool | None = None
-    dwm_scale: float | None = Field(default=None, ge=0, le=2,
+    dwm_scale: FiniteFloat | None = Field(default=None,
         description='Omit to keep the image engine default; zero requests a clean baseline.')
 
 
