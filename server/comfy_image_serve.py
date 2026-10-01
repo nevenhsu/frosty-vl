@@ -19,6 +19,7 @@ import json
 import math
 import os
 import queue
+import re
 import secrets
 import threading
 import time
@@ -26,7 +27,9 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
@@ -36,6 +39,7 @@ from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .image_library import ImageLibrary, TYPES
+from .comfy_progress import ComfyProgress, event_updates
 
 
 MAX_BODY = 36_000_000
@@ -50,6 +54,10 @@ class ComfyConfigError(ValueError):
 
 class ComfyError(RuntimeError):
     """An HTTP or protocol failure returned by ComfyUI."""
+
+
+class ComfyRejected(ComfyError):
+    """The server explicitly rejected a prompt before queueing it."""
 
 
 class JobCancelled(RuntimeError):
@@ -285,11 +293,16 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ComfyConfig | Non
 
 
 class ComfyClient:
-    """Small stdlib-only client for the ComfyUI HTTP API."""
+    """ComfyUI HTTP client with optional execution event subscription."""
 
     def __init__(self, base_url: str, timeout: float = 30.0):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.client_id = secrets.token_hex(16)
+        self._targeted_interrupt = None
+
+    def progress(self):
+        return ComfyProgress(self.base_url, self.client_id)
 
     def _request(self, method: str, path: str, payload: Any = _MISSING,
                  query: Mapping[str, Any] | None = None, headers: Mapping[str, str] | None = None,
@@ -321,12 +334,20 @@ class ComfyClient:
                 raise ComfyError("ComfyUI returned invalid JSON") from exc
         return raw
 
-    def prompt(self, workflow: Mapping[str, Any]) -> Mapping[str, Any]:
-        result = self._request("POST", "/prompt", {"prompt": workflow})
+    def reserve_prompt(self):
+        if self._targeted_interrupt is None:
+            self.health()
+        return str(uuid.uuid4()) if self._targeted_interrupt else None
+
+    def prompt(self, workflow: Mapping[str, Any], prompt_id=None) -> Mapping[str, Any]:
+        payload = {"prompt": workflow, "client_id": self.client_id}
+        if prompt_id:
+            payload["prompt_id"] = prompt_id
+        result = self._request("POST", "/prompt", payload)
         if not isinstance(result, Mapping):
             raise ComfyError("ComfyUI /prompt returned a non-object response")
         if result.get("error") or result.get("node_errors"):
-            raise ComfyError(_error_text(result))
+            raise ComfyRejected(_error_text(result))
         if not result.get("prompt_id"):
             raise ComfyError("ComfyUI /prompt did not return prompt_id")
         return result
@@ -335,6 +356,16 @@ class ComfyClient:
         result = self._request("GET", "/system_stats", timeout=min(2.0, self.timeout))
         if not isinstance(result, Mapping):
             raise ComfyError("ComfyUI /system_stats returned a non-object response")
+        self._targeted_interrupt = self._supports_targeted_interrupt(result)
+
+    @staticmethod
+    def _supports_targeted_interrupt(stats):
+        system = stats.get("system", {}) if isinstance(stats, Mapping) else {}
+        version = system.get("comfyui_version", "") if isinstance(system, Mapping) else ""
+        match = re.match(r"^(\d+)\.(\d+)\.", str(version))
+        # Targeted interruption is verified in the supported 0.37 API. Older
+        # servers may ignore the body and interrupt another client's prompt.
+        return bool(match and tuple(map(int, match.groups())) >= (0, 37))
 
     def history(self, prompt_id: str) -> Mapping[str, Any]:
         result = self._request("GET", "/history/" + urllib.parse.quote(prompt_id, safe=""))
@@ -369,8 +400,14 @@ class ComfyClient:
     def delete_prompt(self, prompt_id: str) -> Any:
         return self._request("POST", "/queue", {"delete": [prompt_id]})
 
-    def interrupt(self) -> Any:
-        return self._request("POST", "/interrupt", {})
+    def interrupt(self, prompt_id: str) -> Any:
+        if not prompt_id:
+            raise ComfyError("Targeted cancellation requires a prompt ID")
+        if self._targeted_interrupt is None:
+            self.health()
+        if not self._targeted_interrupt:
+            raise ComfyError("This ComfyUI server has no confirmed targeted cancellation API")
+        return self._request("POST", "/api/jobs/" + urllib.parse.quote(prompt_id, safe="") + "/cancel", {})
 
 
 def _error_text(value: Any) -> str:
@@ -552,7 +589,11 @@ class ComfyImageEngine:
             except Exception as exc:
                 traceback.print_exc()
                 if job_id in self.jobs:
-                    self.update(job_id, status="error", stage="Error", error=f"{type(exc).__name__}: {exc}")
+                    current = self.get(job_id)
+                    if current.get("cancel") and current.get("prompt_ids"):
+                        self._cancel_remote(job_id, current["prompt_ids"][-1])
+                    elif current.get("status") != "cancelled":
+                        self.update(job_id, status="error", stage="Error", error=f"{type(exc).__name__}: {exc}")
             finally:
                 self.pending.task_done()
 
@@ -611,39 +652,70 @@ class ComfyImageEngine:
         return self.get(job_id)
 
     def cancel(self, job_id: str) -> dict[str, Any]:
-        current = self.get(job_id)
-        if current["status"] in {"done", "error", "cancelled"}:
-            return current
-        self.update(job_id, cancel=True, stage="Cancelling")
+        with self.lock:
+            current = self.get(job_id)
+            if current["status"] in {"done", "error", "cancelled"}:
+                return current
+            self.update(job_id, cancel=True, status="cancelling", stage="Cancelling ComfyUI",
+                        progress_determinate=False, cancel_sent_prompt_id=None)
+        if current.get("submitting_prompt"):
+            # The worker records the new remote ID before confirming cancellation.
+            return self.get(job_id)
         prompt_ids = current.get("prompt_ids", [])
         if not prompt_ids:
             # The prompt has not reached ComfyUI.  The worker consumes and
             # discards it; no remote cancellation call is needed.
-            return self.update(job_id, status="cancelled", stage="Cancelled")
-        for prompt_id in prompt_ids:
-            self._cancel_remote(job_id, prompt_id)
+            if current["status"] == "queued":
+                return self.update(job_id, status="cancelled", stage="Cancelled")
+            return self.get(job_id)
+        self._cancel_remote(job_id, prompt_ids[-1])
         return self.get(job_id)
 
-    def _cancel_remote(self, job_id: str, prompt_id: str) -> None:
+    def _cancel_remote(self, job_id: str, prompt_id: str) -> bool:
         try:
             state = self.client.queue()
         except Exception as exc:
             self.update(job_id, cancel_error=f"Cannot inspect ComfyUI queue: {exc}")
-            return
+            self.update(job_id, status="cancelling", stage="Cannot confirm ComfyUI cancellation",
+                        progress_determinate=False)
+            return False
+        if not isinstance(state, Mapping) or not isinstance(state.get("queue_running"), list) or not isinstance(state.get("queue_pending"), list):
+            self.update(job_id, status="cancelling", stage="Cannot confirm ComfyUI cancellation",
+                        cancel_error="ComfyUI returned an invalid queue", progress_determinate=False)
+            return False
         running = _queue_ids(state.get("queue_running", [])) if isinstance(state, Mapping) else set()
         pending = _queue_ids(state.get("queue_pending", [])) if isinstance(state, Mapping) else set()
         try:
+            if prompt_id in running or prompt_id in pending:
+                self.update(job_id, remote_seen=True)
             if prompt_id in pending:
                 self.client.delete_prompt(prompt_id)
-                self.update(job_id, status="cancelled", stage="Cancelled")
+                self.update(job_id, status="cancelling", stage="Removing queued ComfyUI image")
             elif prompt_id in running:
-                # ComfyUI's /interrupt is global and can race with unrelated
-                # clients. Let this prompt finish, then discard its result.
-                self.update(job_id, status="cancelling", stage="Cancelling after the current ComfyUI render")
+                self.update(job_id, status="cancelling", stage="Stopping ComfyUI at the next interrupt checkpoint")
+                with self.lock:
+                    sent = self.jobs[job_id].get("cancel_sent_prompt_id") == prompt_id
+                    if not sent:
+                        self.jobs[job_id]["cancel_sent_prompt_id"] = prompt_id
+                if not sent:
+                    self.client.interrupt(prompt_id)
             else:
-                self.update(job_id, status="cancelling", stage="Waiting for ComfyUI cancellation")
+                current = self.get(job_id)
+                if current.get("submission_uncertain") and not current.get("remote_seen"):
+                    history = self.client.history(prompt_id)
+                    if not isinstance(history, Mapping) or not history.get(prompt_id):
+                        self.update(job_id, status="cancelling", stage="Waiting for ComfyUI submission acknowledgement",
+                                    cancel_error="Cannot yet confirm whether ComfyUI accepted the prompt")
+                        return False
+                self.update(job_id, status="cancelled", stage="Cancelled", progress_determinate=False,
+                            cancel_error=None)
+                return True
         except Exception as exc:
-            self.update(job_id, cancel_error=str(exc))
+            if self.get(job_id).get("status") == "cancelled":
+                return True
+            self.update(job_id, cancel_error=str(exc), cancel_sent_prompt_id=None,
+                        status="cancelling", stage="Cannot confirm ComfyUI cancellation")
+        return False
 
     def _binding_value(self, bindings: Mapping[str, list[tuple[str, str]]], field: str) -> list[tuple[str, str]]:
         values = bindings.get(field)
@@ -764,6 +836,10 @@ class ComfyImageEngine:
         self.update(job_id, status="running", stage="Uploading references", _started_at=started)
         references = self._upload_references(job_id, spec) if spec.images_b64 else []
         mask = self._upload_mask(job_id, spec)
+        with self.client.progress() if hasattr(self.client, "progress") else nullcontext() as progress:
+            self._run_variations(job_id, job, spec, references, mask, started, progress)
+
+    def _run_variations(self, job_id, job, spec, references, mask, started, progress):
         for index in range(spec.n):
             current = self.get(job_id)
             if current.get("cancel"):
@@ -771,43 +847,81 @@ class ComfyImageEngine:
                 return
             seed = (job["seed"] + index) % (2**63)
             workflow = self.build_workflow(spec, seed, references, mask)
-            self.update(job_id, stage=f"Queueing image {index + 1} of {spec.n}")
+            reserved = self.client.reserve_prompt() if hasattr(self.client, "reserve_prompt") else None
+            with self.lock:
+                if self.get(job_id).get("cancel"):
+                    self.update(job_id, status="cancelled", stage="Cancelled")
+                    return
+                self.update(job_id, stage=f"Queueing image {index + 1} of {spec.n}", submitting_prompt=True,
+                            progress_determinate=False, sampling_step=0, sampling_steps=spec.steps,
+                            sampling_image=index + 1, sampling_images=spec.n)
+                if reserved:
+                    self.update(job_id, prompt_ids=self.get(job_id).get("prompt_ids", []) + [reserved])
             image_started = started if index == 0 else time.monotonic()
-            response = self.client.prompt(workflow)
+            try:
+                response = self.client.prompt(workflow, prompt_id=reserved) if reserved else self.client.prompt(workflow)
+            except Exception as exc:
+                self.update(job_id, submitting_prompt=False)
+                if not reserved:
+                    raise
+                cause = exc.__cause__
+                if isinstance(exc, ComfyRejected) or isinstance(cause, urllib.error.HTTPError) and 400 <= cause.code < 500:
+                    raise
+                self.update(job_id, cancel=True, status="cancelling", progress_determinate=False,
+                            submission_error=str(exc), submission_uncertain=True, remote_seen=False)
+                result = self._wait_prompt(job_id, reserved, spec, seed, index, image_started, progress, workflow)
+                if result == "cancelled":
+                    self.update(job_id, status="error", stage="ComfyUI submission failed; remote job stopped", error=str(exc))
+                return
             prompt_id = str(response["prompt_id"])
-            self.update(job_id, prompt_ids=self.get(job_id).get("prompt_ids", []) + [prompt_id], stage="Waiting for ComfyUI")
-            result = self._wait_prompt(job_id, prompt_id, spec, seed, index, image_started)
+            ids = self.get(job_id).get("prompt_ids", [])
+            self.update(job_id, prompt_ids=(ids[:-1] if reserved else ids) + [prompt_id],
+                        submitting_prompt=False, stage="Waiting for ComfyUI")
+            result = self._wait_prompt(job_id, prompt_id, spec, seed, index, image_started, progress, workflow)
             if result == "cancelled":
                 return
-            if result == "error":
+            if result in {"error", "cancelling"}:
                 return
         if self.get(job_id).get("cancel"):
             self.update(job_id, status="cancelled", stage="Cancelled")
             return
         self.update(job_id, status="done", stage="Complete", seconds=round(time.monotonic() - started, 2),
-                    completed_steps=spec.steps * spec.n)
+                    completed_steps=spec.steps * spec.n, progress_determinate=True)
 
     def _wait_prompt(self, job_id: str, prompt_id: str, spec: ImageRequest, seed: int,
-                     variation: int, started: float) -> str:
+                     variation: int, started: float, progress=None, workflow=None) -> str:
         deadline = time.monotonic() + (self.config.poll_timeout if self.config else 86_400)
         while time.monotonic() < deadline:
             job = self.get(job_id)
-            if job.get("cancel") and job.get("status") == "cancelled":
-                return "cancelled"
-            if job.get("cancel") and job.get("status") not in {"cancelled", "cancelling"}:
-                self._cancel_remote(job_id, prompt_id)
+            if job.get("cancel"):
+                if self._cancel_remote(job_id, prompt_id):
+                    return "cancelled"
+                time.sleep(self.config.poll_interval if self.config else 0.25)
+                continue
+            if progress is not None:
+                for event in progress.events():
+                    for update in event_updates(event, prompt_id, workflow or {}):
+                        if update.get("progress_determinate"):
+                            current = self.get(job_id)
+                            fraction = update["sampling_step"] / update["sampling_steps"]
+                            completed = spec.steps * (variation + fraction)
+                            if completed < current.get("completed_steps", 0):
+                                continue
+                            update["completed_steps"] = completed
+                        self.update(job_id, **update)
+                if not progress.available:
+                    self.update(job_id, progress_determinate=False,
+                                stage="Waiting for ComfyUI (live progress unavailable)")
             try:
                 history = self.client.history(prompt_id)
             except Exception as exc:
                 if self.get(job_id).get("cancel"):
-                    self.update(job_id, status="cancelled", stage="Cancelled")
-                    return "cancelled"
+                    continue
                 self.update(job_id, status="error", stage="ComfyUI error", error=str(exc))
                 return "error"
             job = self.get(job_id)
             if job.get("cancel"):
-                self.update(job_id, status="cancelled", stage="Cancelled")
-                return "cancelled"
+                continue
             entry = history.get(prompt_id, history) if isinstance(history, Mapping) else {}
             status = entry.get("status", {}) if isinstance(entry, Mapping) else {}
             status_name = str(status.get("status_str", "")).lower() if isinstance(status, Mapping) else ""
@@ -824,11 +938,13 @@ class ComfyImageEngine:
                     self.update(job_id, status="cancelled", stage="Cancelled")
                     return "cancelled"
                 try:
+                    self.update(job_id, stage="Saving image", progress_determinate=False)
                     self._publish_outputs(job_id, spec, seed, prompt_id, outputs, variation, round(time.monotonic() - started, 2))
                 except JobCancelled:
-                    self.update(job_id, status="cancelled", stage="Cancelled")
-                    return "cancelled"
+                    continue
                 except Exception as exc:
+                    if self.get(job_id).get("cancel"):
+                        continue
                     self.update(job_id, status="error", stage="Publish error", error=f"{type(exc).__name__}: {exc}")
                     return "error"
                 return "done"
@@ -836,17 +952,23 @@ class ComfyImageEngine:
                 # Older Comfy versions omit status.completed once outputs are
                 # available; success plus outputs is still terminal.
                 try:
+                    self.update(job_id, stage="Saving image", progress_determinate=False)
                     self._publish_outputs(job_id, spec, seed, prompt_id, outputs, variation, round(time.monotonic() - started, 2))
                 except JobCancelled:
-                    self.update(job_id, status="cancelled", stage="Cancelled")
-                    return "cancelled"
+                    continue
+                except Exception:
+                    if self.get(job_id).get("cancel"):
+                        continue
+                    raise
                 return "done"
-            self.update(job_id, completed_steps=min(spec.steps * (variation + 1),
-                                                    self.get(job_id).get("completed_steps", 0) + 1))
             time.sleep(self.config.poll_interval if self.config else 0.25)
         if self.get(job_id).get("cancel"):
-            self.update(job_id, status="cancelled", stage="Cancelled")
-            return "cancelled"
+            if self._cancel_remote(job_id, prompt_id):
+                return "cancelled"
+            self.update(job_id, status="cancelling", stage="ComfyUI cancellation not confirmed; retry Cancel",
+                        cancel_confirmation_pending=True,
+                        cancel_error="Timed out confirming ComfyUI stopped")
+            return "cancelling"
         self.update(job_id, status="error", stage="ComfyUI timeout", error="Timed out waiting for ComfyUI history")
         return "error"
 
@@ -1026,6 +1148,9 @@ def submit(spec: ImageRequest):
 
 @app.get("/jobs/{job_id}")
 def job(job_id: str):
+    current = engine.get(job_id)
+    if current.get("status") == "cancelling" and current.get("cancel_confirmation_pending") and current.get("prompt_ids"):
+        engine._cancel_remote(job_id, current["prompt_ids"][-1])
     return engine.get(job_id)
 
 

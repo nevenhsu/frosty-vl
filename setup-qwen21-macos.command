@@ -219,7 +219,7 @@ if [[ $check_only -eq 1 ]]; then
     check_turbo_node_bundle
   fi
   [[ -x "$adapter_venv/bin/python" ]] || fail "Frosty adapter environment is missing."
-  "$adapter_venv/bin/python" -c 'import fastapi, PIL, uvicorn'
+  "$adapter_venv/bin/python" -c 'import fastapi, PIL, uvicorn; from websockets.sync.client import connect'
   [[ -f "$config_path" ]] || fail "Profile adapter config is missing: $config_path"
   echo "All portable runtime components are present."
   exit 0
@@ -292,7 +292,7 @@ if [[ ! -x "$adapter_venv/bin/python" ]]; then
   echo "Creating Frosty adapter environment..."
   "$comfy_python" -m venv "$adapter_venv"
 fi
-if ! "$adapter_venv/bin/python" -c 'import fastapi, PIL, uvicorn' >/dev/null 2>&1; then
+if ! "$adapter_venv/bin/python" -c 'import fastapi, PIL, uvicorn; from websockets.sync.client import connect' >/dev/null 2>&1; then
   echo "Installing Frosty adapter dependencies..."
   "$adapter_venv/bin/python" -m pip install -r "$bundle_dir/requirements-comfy.txt"
 fi

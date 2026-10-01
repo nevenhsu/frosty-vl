@@ -29,7 +29,10 @@ async function studio(studioOptions={}) {
     else if(url==='/api/images/gallery/restore'){trashed=false;data={ok:true,results:[{ok:true,name:'fixture.png'}]};}
     else if(url==='/api/images/gallery/purge'){purged=true;data={ok:true,results:[{ok:true,name:'fixture.png',state:'purged'}]};}
     else if(url==='/api/images/jobs')data={id:'img_'+'c'.repeat(24)};
-    else if(url.startsWith('/api/images/jobs/'))data={status:'done',stage:'Complete',created_at:Date.now()/1000,seconds:1,outputs:[]};
+    else if(url.startsWith('/api/images/jobs/')){
+      const override=typeof studioOptions.job==='function'?studioOptions.job(url,payload):studioOptions.job;
+      data=override||{status:'done',stage:'Complete',created_at:Date.now()/1000,seconds:1,outputs:[]};
+    }
     return {ok:true,json:async()=>data,blob:async()=>new w.Blob(['fixture'],{type:'image/png'})};
   };
   new vm.Script(fs.readFileSync(path.join(root,'ui/image_studio.js'),'utf8')).runInContext(dom.getInternalVMContext());
@@ -202,6 +205,75 @@ test('Turbo sampling defaults to six and accepts other step counts',async()=>{
     assert.equal(request.payload.width,512);assert.equal(request.payload.height,512);
     assert.equal(request.payload.true_cfg_scale,1);
     assert.equal(request.payload.negative_prompt,'');
+  } finally {close();}
+});
+
+test('job progress stays indeterminate outside sampling and exposes aggregate sampling progress',async()=>{
+  const {w,close}=await studio();
+  try {
+    const progress=w.document.querySelector('#progress'),stage=w.document.querySelector('#job-stage');
+    await w.eval(`updateJobProgress({status:'running',stage:'Loading image model',progress_determinate:false,completed_steps:0,total_steps:6})`);
+    assert.equal(progress.hasAttribute('value'),false);
+    assert.equal(stage.textContent,'Loading image model');
+    assert.equal(progress.getAttribute('aria-valuetext'),'Loading image model');
+
+    await w.eval(`updateJobProgress({status:'running',stage:'Image 1 of 3 · Sampling 2 / 6 steps',progress_determinate:true,sampling_step:2,sampling_steps:6,sampling_image:1,sampling_images:3,completed_steps:2,total_steps:18})`);
+    assert.equal(progress.value,2);assert.equal(progress.max,18);
+    assert.equal(stage.textContent,'Sampling');
+    assert.equal(w.document.querySelector('#progress-detail').textContent,'Image 1 of 3 · Sampling 2 / 6 steps');
+    assert.equal(w.document.querySelector('#progress-percent').textContent,'11%');
+    assert.ok(Math.abs(parseFloat(w.document.querySelector('#progress-fill').style.width)-100/9)<0.001);
+    assert.equal(progress.getAttribute('aria-label'),'Image 1 of 3 · Sampling 2 / 6 steps · 11%');
+    assert.equal(progress.getAttribute('aria-valuenow'),'2');
+
+    await w.eval(`updateJobProgress({status:'running',stage:'Decoding image',progress_determinate:false,completed_steps:2,total_steps:18})`);
+    assert.equal(progress.hasAttribute('value'),false);
+    assert.equal(stage.textContent,'Decoding image');
+    assert.equal(w.document.querySelector('#progress-percent').textContent,'');
+
+    await w.eval(`updateJobProgress({status:'done',stage:'Complete',completed_steps:2,total_steps:18})`);
+    assert.equal(progress.value,18);assert.equal(progress.max,18);
+    assert.equal(progress.getAttribute('aria-label'),'Complete');
+    assert.equal(progress.getAttribute('aria-valuenow'),'18');
+    assert.equal(w.document.querySelector('#progress-fill').style.width,'100%');
+    assert.equal(w.document.querySelector('#progress-percent').textContent,'100%');
+
+    await w.eval(`updateJobProgress({status:'error',stage:'Render stopped',progress_determinate:true,completed_steps:18,total_steps:18})`);
+    assert.equal(progress.hasAttribute('value'),false);
+    assert.equal(progress.dataset.state,'stopped');
+    assert.equal(w.document.querySelector('#progress-fill').style.width,'0%');
+    await w.eval(`updateJobProgress({status:'cancelling',stage:'Stopping ComfyUI',progress_determinate:false,completed_steps:2,total_steps:6})`);
+    assert.equal(progress.dataset.state,'active');
+    assert.equal(progress.hasAttribute('value'),false);
+    assert.equal(w.document.querySelector('#progress-detail').textContent,'Waiting for the render engine to stop');
+    assert.equal(w.document.querySelector('#progress-percent').textContent,'');
+  } finally {close();}
+});
+
+test('native sampling stages fall back to actual completed steps',async()=>{
+  const {w,close}=await studio();
+  try {
+    await w.eval(`updateJobProgress({status:'running',stage:'Image 2 of 3 · step 1 of 6',completed_steps:7,total_steps:18})`);
+    const progress=w.document.querySelector('#progress');
+    assert.equal(progress.value,7);assert.equal(progress.max,18);
+    assert.equal(w.document.querySelector('#job-stage').textContent,'Sampling');
+    assert.equal(w.document.querySelector('#progress-detail').textContent,'Image 2 of 3 · Sampling 1 / 6 steps');
+    assert.equal(w.document.querySelector('#progress-percent').textContent,'39%');
+    for(const stage of ['Uploading references','Encoding prompt and references','Preparing image sampling','Decoding image','Saving image']){
+      await w.eval(`updateJobProgress(${JSON.stringify({status:'running',stage,completed_steps:7,total_steps:18})})`);
+      assert.equal(progress.hasAttribute('value'),false);
+    }
+  } finally {close();}
+});
+
+test('result image actions share the quiet button treatment',async()=>{
+  const {w,close}=await studio();
+  try {
+    await w.eval(`resultCard({name:'result.png',width:512,height:512,seed:7},document.querySelector('#results'))`);
+    const group=w.document.querySelector('.result-action-group');
+    assert.ok(group);
+    assert.deepEqual([...group.children].map(item=>[item.tagName,item.classList.contains('quiet')]),[
+      ['BUTTON',true],['A',true],['BUTTON',true]]);
   } finally {close();}
 });
 

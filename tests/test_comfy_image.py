@@ -94,6 +94,7 @@ class FakeComfy:
         self.prompts = []
         self.views = []
         self.interrupts = 0
+        self.interrupted_ids = []
         self.deleted = []
         self.error = False
 
@@ -122,8 +123,9 @@ class FakeComfy:
     def delete_prompt(self, prompt_id):
         self.deleted.append(prompt_id)
 
-    def interrupt(self):
+    def interrupt(self, prompt_id):
         self.interrupts += 1
+        self.interrupted_ids.append(prompt_id)
 
 
 def run_job(engine, job_id):
@@ -392,14 +394,175 @@ def test_done_error_and_cancel_mapping(configured):
     assert fake.interrupts == 0
 
 
-def test_running_cancel_never_uses_global_interrupt(configured):
+def test_running_cancel_targets_comfy_prompt_and_waits_for_acknowledgement(configured):
     engine, fake = configured
     job = engine.submit(comfy.ImageRequest(prompt="running", seed=3))
     engine.update(job["id"], status="running", prompt_ids=["remote"])
     fake.queue = lambda: {"queue_running": [[1, "remote"]], "queue_pending": []}
     result = engine.cancel(job["id"])
     assert result["status"] == "cancelling"
+    assert fake.interrupted_ids == ["remote"]
+    engine._cancel_remote(job["id"], "remote")
+    assert fake.interrupted_ids == ["remote"]
+    assert engine.get(job["id"])["status"] == "cancelling"
+    fake.queue = lambda: {"queue_running": [[2, "someone-else"]], "queue_pending": []}
+    assert engine._cancel_remote(job["id"], "remote") is True
+    assert engine.get(job["id"])["status"] == "cancelled"
+    assert fake.interrupted_ids == ["remote"]
+
+
+@pytest.mark.parametrize("version,supported", [("0.37.0", True), ("0.38.1", True),
+                                               ("0.36.0", False), ("", False)])
+def test_targeted_interrupt_protocol_never_sends_global_request(monkeypatch, version, supported):
+    client = comfy.ComfyClient("http://localhost:8188")
+    calls = []
+
+    def request(method, path, payload=comfy._MISSING, **kwargs):
+        calls.append((method, path, payload))
+        return {"system": {"comfyui_version": version}} if path == "/system_stats" else b""
+
+    monkeypatch.setattr(client, "_request", request)
+    if supported:
+        client.interrupt("mine")
+        assert calls[-1] == ("POST", "/api/jobs/mine/cancel", {})
+    else:
+        with pytest.raises(comfy.ComfyError, match="confirmed targeted"):
+            client.interrupt("mine")
+        assert all('/cancel' not in path for _, path, _ in calls)
+    with pytest.raises(comfy.ComfyError, match="prompt ID"):
+        client.interrupt("")
+
+
+@pytest.mark.parametrize("cancel_on", [1, 2])
+def test_cancel_while_posting_prompt_still_interrupts_remote(configured, cancel_on):
+    engine, fake = configured
+    original_prompt = fake.prompt
+
+    def submit(graph):
+        if len(fake.prompts) + 1 == cancel_on:
+            assert engine.cancel(job["id"])["status"] == "cancelling"
+        return original_prompt(graph)
+
+    running = True
+
+    def remote_queue():
+        nonlocal running
+        result = {"queue_running": [[1, f"prompt-{cancel_on}"]] if running else [], "queue_pending": []}
+        running = False
+        return result
+
+    fake.prompt, fake.queue = submit, remote_queue
+    job = engine.submit(comfy.ImageRequest(prompt="fox", seed=1, n=cancel_on))
+    run_job(engine, job["id"])
+    assert fake.interrupted_ids == [f"prompt-{cancel_on}"]
+    assert engine.get(job["id"])["status"] == "cancelled"
+    assert len(fake.views) == cancel_on - 1
+
+
+def test_unconfirmed_remote_cancel_is_not_reported_as_cancelled(tmp_path, monkeypatch):
+    mapping = config_mapping(tmp_path)
+    mapping.update(poll_timeout=0.01)
+    fake = FakeComfy()
+    fake.queue = lambda: {"queue_running": [[1, "remote"]], "queue_pending": []}
+    engine = comfy.ComfyImageEngine(comfy.ComfyConfig.from_mapping(mapping), fake)
+    job = engine.submit(comfy.ImageRequest(prompt="fox", seed=1))
+    engine.update(job["id"], status="running", prompt_ids=["remote"])
+    assert engine.cancel(job["id"])["status"] == "cancelling"
+    result = engine._wait_prompt(job["id"], "remote", comfy.ImageRequest(prompt="fox"), 1, 0, time.monotonic())
+    assert result == "cancelling"
+    assert engine.get(job["id"])["status"] == "cancelling"
+    assert engine.get(job["id"])["cancel_confirmation_pending"] is True
+    assert fake.interrupted_ids == ["remote"]
+    engine.cancel(job["id"])
+    assert fake.interrupted_ids == ["remote", "remote"]
+    fake.queue = lambda: {"queue_running": [], "queue_pending": []}
+    monkeypatch.setattr(comfy, "engine", engine)
+    assert TestClient(comfy.app).get('/jobs/' + job['id']).json()['status'] == 'cancelled'
+
+
+def test_lost_prompt_response_still_has_a_cancellable_remote_id(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    client = comfy.ComfyClient("http://localhost:8188")
+    monkeypatch.setattr(client, "progress", lambda: nullcontext())
+    accepted = None
+    inspected = 0
+    interrupted = []
+
+    def request(method, path, payload=comfy._MISSING, **kwargs):
+        nonlocal accepted, inspected
+        if path == '/system_stats':
+            return {'system': {'comfyui_version': '0.37.0'}}
+        if path == '/prompt':
+            accepted = payload['prompt_id']
+            assert accepted in engine.get(job['id'])['prompt_ids']
+            raise comfy.ComfyError('response lost after acceptance')
+        if path == '/queue':
+            inspected += 1
+            return {'queue_running': [[1, accepted]] if inspected == 1 else [], 'queue_pending': []}
+        if path == '/api/jobs/' + str(accepted) + '/cancel':
+            interrupted.append(accepted)
+            return b''
+        raise AssertionError(path)
+
+    monkeypatch.setattr(client, '_request', request)
+    engine = comfy.ComfyImageEngine(comfy.ComfyConfig.from_mapping(config_mapping(tmp_path)), client)
+    job = engine.submit(comfy.ImageRequest(prompt='fox', seed=1))
+    run_job(engine, job['id'])
+    assert interrupted == [accepted]
+    assert engine.get(job['id'])['status'] == 'error'
+    assert 'remote job stopped' in engine.get(job['id'])['stage']
+    assert engine.get(job['id'])['outputs'] == []
+
+
+def test_lost_response_cannot_confirm_cancel_before_remote_acceptance(configured):
+    engine, fake = configured
+    job = engine.submit(comfy.ImageRequest(prompt='fox', seed=1))
+    engine.update(job['id'], status='cancelling', cancel=True, prompt_ids=['mine'],
+                  submission_uncertain=True, remote_seen=False)
+    fake.history = lambda _: {}
+    assert engine._cancel_remote(job['id'], 'mine') is False
+    assert engine.get(job['id'])['status'] == 'cancelling'
+    fake.queue = lambda: {'queue_running': [[1, 'mine']], 'queue_pending': []}
+    assert engine._cancel_remote(job['id'], 'mine') is False
+    assert fake.interrupted_ids == ['mine']
+    fake.queue = lambda: {'queue_running': [], 'queue_pending': []}
+    assert engine._cancel_remote(job['id'], 'mine') is True
+    assert engine.get(job['id'])['status'] == 'cancelled'
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_publish_failure_cannot_overwrite_confirmed_cancel(configured, legacy):
+    engine, fake = configured
+    original_history = fake.history
+    if legacy:
+        fake.history = lambda prompt_id: {prompt_id: {'outputs': original_history(prompt_id)[prompt_id]['outputs']}}
+
+    def failing_view(*args):
+        engine.cancel(job['id'])
+        raise comfy.ComfyError('view failed after cancellation')
+
+    fake.view = failing_view
+    job = engine.submit(comfy.ImageRequest(prompt='fox', seed=1))
+    run_job(engine, job['id'])
+    assert engine.get(job['id'])['status'] == 'cancelled'
+    assert engine.get(job['id'])['outputs'] == []
+
+
+def test_pending_cancel_waits_for_queue_removal_and_queue_error_is_not_ack(configured):
+    engine, fake = configured
+    job = engine.submit(comfy.ImageRequest(prompt="fox", seed=1))
+    engine.update(job["id"], status="running", prompt_ids=["mine"])
+    fake.queue = lambda: {"queue_running": [[1, "other"]], "queue_pending": [[2, "mine"]]}
+    assert engine.cancel(job["id"])["status"] == "cancelling"
+    assert fake.deleted == ["mine"]
     assert fake.interrupts == 0
+    fake.queue = lambda: {}
+    assert engine._cancel_remote(job["id"], "mine") is False
+    assert engine.get(job["id"])["status"] == "cancelling"
+    assert engine.get(job["id"])["cancel_error"]
+    fake.queue = lambda: {"queue_running": [[1, "other"]], "queue_pending": []}
+    assert engine._cancel_remote(job["id"], "mine") is True
+    assert engine.get(job["id"])["status"] == "cancelled"
 
 
 def test_cancel_during_history_discards_completed_output(configured):
@@ -476,6 +639,153 @@ def test_no_duplicate_publish(configured):
     engine._publish_outputs(job["id"], spec, 1, "remote", outputs, 0)
     assert len(engine.get(job["id"])["outputs"]) == 1
     assert len(fake.views) == 1
+
+
+def test_prompt_submits_same_client_id_as_progress_connection(monkeypatch):
+    client = comfy.ComfyClient("http://localhost:8188")
+    requests = []
+    monkeypatch.setattr(client, "_request", lambda *args: requests.append(args) or {"prompt_id": "remote"})
+    client.prompt({"node": {}})
+    assert requests[0][2]["client_id"] == client.client_id
+    assert client.client_id in client.progress().url
+
+
+def test_real_progress_is_scoped_monotonic_and_subscription_closes(configured):
+    engine, fake = configured
+    snapshots = []
+
+    class Progress:
+        available = True
+        opened = closed = False
+        turn = 0
+
+        def __enter__(self):
+            self.opened = True
+            return self
+
+        def __exit__(self, *_):
+            self.closed = True
+
+        def events(self):
+            self.turn += 1
+            data = {"prompt_id": "prompt-1", "node": "seed", "value": 2, "max": 6}
+            if self.turn == 1:
+                return [{"type": "progress", "data": {**data, "prompt_id": "other"}}]
+            if self.turn == 2:
+                return [{"type": "progress", "data": data}]
+            if self.turn == 3:
+                return [{"type": "progress", "data": {**data, "value": 1}}]
+            return [{"type": "executing", "data": {"prompt_id": "prompt-1", "node": "save"}}]
+
+    progress = Progress()
+    fake.progress = lambda: progress
+    original_prompt, original_history = fake.prompt, fake.history
+
+    def prompt(graph):
+        assert progress.opened
+        return original_prompt(graph)
+
+    def history(prompt_id):
+        snapshots.append(engine.get(job["id"]))
+        return original_history(prompt_id) if len(snapshots) == 4 else {}
+
+    fake.prompt, fake.history = prompt, history
+    job = engine.submit(comfy.ImageRequest(prompt="fox", seed=1, steps=6))
+    run_job(engine, job["id"])
+    assert [snap["completed_steps"] for snap in snapshots] == [0, 2, 2, 2]
+    assert snapshots[1]["sampling_step"] == 2
+    assert snapshots[1]["progress_determinate"] is True
+    assert snapshots[3]["progress_determinate"] is False
+    assert engine.get(job["id"])["status"] == "done"
+    assert progress.closed
+
+
+def test_history_polling_never_fabricates_steps(configured):
+    engine, fake = configured
+    snapshots = []
+    history = fake.history
+
+    def delayed(prompt_id):
+        snapshots.append(engine.get(job["id"])["completed_steps"])
+        return history(prompt_id) if len(snapshots) == 4 else {}
+
+    fake.history = delayed
+    job = engine.submit(comfy.ImageRequest(prompt="fox", seed=1, steps=6))
+    run_job(engine, job["id"])
+    assert snapshots == [0, 0, 0, 0]
+    assert engine.get(job["id"])["status"] == "done"
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_progress_loss_keeps_history_authoritative_and_closes(configured, cancel):
+    engine, fake = configured
+
+    class Progress:
+        available = False
+        closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            self.closed = True
+
+        def events(self):
+            return []
+
+    progress = Progress()
+    fake.progress = lambda: progress
+    history = fake.history
+
+    def finish(prompt_id):
+        snapshot = engine.get(job["id"])
+        assert snapshot["completed_steps"] == 0
+        assert snapshot["progress_determinate"] is False
+        assert "live progress unavailable" in snapshot["stage"]
+        if cancel:
+            engine.update(job["id"], cancel=True)
+        return history(prompt_id)
+
+    fake.history = finish
+    job = engine.submit(comfy.ImageRequest(prompt="fox", seed=1, steps=6))
+    run_job(engine, job["id"])
+    assert engine.get(job["id"])["status"] == ("cancelled" if cancel else "done")
+    assert len(fake.views) == (0 if cancel else 1)
+    assert progress.closed
+
+
+def test_multiple_images_use_actual_sampler_fraction_and_image_offset(configured):
+    engine, fake = configured
+    snapshots = []
+
+    class Progress:
+        available = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def events(self):
+            count = len(fake.prompts)
+            return [{"type": "progress", "data": {"prompt_id": f"prompt-{count}",
+                     "node": "seed", "value": 2, "max": 6 if count == 1 else 8}}]
+
+    fake.progress = Progress
+    history = fake.history
+
+    def finish(prompt_id):
+        snapshots.append(engine.get(job["id"]))
+        return history(prompt_id)
+
+    fake.history = finish
+    job = engine.submit(comfy.ImageRequest(prompt="fox", seed=1, steps=6, n=2))
+    run_job(engine, job["id"])
+    assert [snap["completed_steps"] for snap in snapshots] == [2, 7.5]
+    assert [snap["sampling_image"] for snap in snapshots] == [1, 2]
+    assert all(snap["sampling_images"] == 2 for snap in snapshots)
+    assert engine.get(job["id"])["status"] == "done"
 
 
 def test_api_health_and_gallery_basics(configured, monkeypatch):

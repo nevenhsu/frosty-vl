@@ -150,6 +150,16 @@ Gallery shows this value after size and seed. The first variation includes model
 loading and input preparation; later variations record their own elapsed time.
 Existing photos without recorded seconds omit this field in Gallery.
 
+Studio subscribes to ComfyUI execution events for the current image job. Loading,
+encoding and decoding show an animated waiting bar; sampler callbacks show the
+actual step count and percentage. If live events are unavailable, rendering still
+finishes through history polling, without inventing a step count.
+Cancel removes the queued prompt or sends a targeted interrupt for the running
+prompt. Studio keeps showing Cancelling until ComfyUI confirms that prompt is no
+longer queued or running. An active tensor operation may still need to reach its
+next interrupt checkpoint. The verified targeted API requires ComfyUI 0.37 or
+newer; an older or unrecognized server never receives a global interrupt.
+
 ## Local verification
 
 On 2026-10-01, the M1 Pro 16 GB installation completed a 512 × 512 six-step

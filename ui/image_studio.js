@@ -120,7 +120,7 @@ function applyCapabilities(health){
 }
 async function refreshHealth(){try{const h=await api('/api/images/health');syncDwm(h);state.ready=!!h.ready;state.enhancementReady=!!h.prompt_enhancement?.t2i&&!!h.prompt_enhancement?.edit;applyCapabilities(h);$('#dot').className=state.ready?'ready':h.error?'error':'';$('#health').textContent=state.ready?'Ready':h.loading?'Loading model':'Offline';$('#health').title=h.error||'';}catch{state.ready=false;$('#health').textContent='Connecting';}$('#generate').disabled=!state.ready||!!state.job;$('#enhance').disabled=!state.ready||!state.enhancementReady||!!state.job;$('#enhance-hint').textContent=state.enhancementReady?'Preview before applying':'Prompt enhancement unavailable';}
 function displayUrl(output){return '/api/images/files/'+encodeURIComponent(output.name);}
-function resultCard(output,container){const article=document.createElement('article');article.className='result-card';article.dataset.name=output.name;const image=document.createElement('img');image.src=displayUrl(output);image.className='checker';image.alt='Generated image';const actions=document.createElement('div');actions.className='result-actions';const meta=document.createElement('span');meta.textContent=`${output.width||''} × ${output.height||''} · seed ${output.seed}`;const right=document.createElement('div');const reuse=document.createElement('button');reuse.className='quiet';reuse.textContent='Add reference';reuse.onclick=()=>useAsReference(output.name);const link=document.createElement('a');link.href=image.src;link.download=output.name;link.textContent='Download PNG ↓';const remove=document.createElement('button');remove.className='quiet danger';remove.textContent='Delete';remove.onclick=async()=>{const item=galleryItems.find(i=>i.name===output.name);if(item)await trashImages([item.id]);else formError('Refresh the gallery and try again.');};right.append(reuse,link,remove);actions.append(meta,right);article.append(image,actions);container.append(article);}
+function resultCard(output,container){const article=document.createElement('article');article.className='result-card';article.dataset.name=output.name;const image=document.createElement('img');image.src=displayUrl(output);image.className='checker';image.alt='Generated image';const actions=document.createElement('div');actions.className='result-actions';const meta=document.createElement('span');meta.textContent=`${output.width||''} × ${output.height||''} · seed ${output.seed}`;const right=document.createElement('div');right.className='result-action-group';const reuse=document.createElement('button');reuse.className='quiet';reuse.textContent='Add reference';reuse.onclick=()=>useAsReference(output.name);const link=document.createElement('a');link.className='quiet';link.href=image.src;link.download=output.name;link.textContent='PNG ↓';const remove=document.createElement('button');remove.className='quiet danger';remove.textContent='Delete';remove.onclick=async()=>{const item=galleryItems.find(i=>i.name===output.name);if(item)await trashImages([item.id]);else formError('Refresh the gallery and try again.');};right.append(reuse,link,remove);actions.append(meta,right);article.append(image,actions);container.append(article);}
 async function useAsReference(name){
   await addGalleryReferences([name]);
 }
@@ -133,7 +133,52 @@ if(state.dwmEnabled)payload.dwm_scale=Number($('#dwm-scale').value);
 if(state.mode==='masked'){payload.mask_b64=maskData();payload.preserve_unmasked=$('#preserve').checked;}
 $('#generate').disabled=true;state.submittedVersion=state.inputVersion;const job=await api(enhance?'/api/images/enhance':'/api/images/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});state.job=job.id;localStorage.setItem('frosty.imageJob',job.id);$('#enhance').disabled=true;if(enhance){$('#enhance-preview').hidden=true;}else{$('#results').replaceChildren();$('#canvas-title').textContent=prompt;$('#gallery-section').hidden=true;}await watchJob();}catch(error){formError(error.message);$('#generate').disabled=!state.ready||!!state.job;}}
 $('#generate').onclick=()=>generate();$('#enhance').onclick=()=>generate(true);document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();generate();}});
-async function watchJob(){if(!state.job)return;$('#status-panel').hidden=false;try{const job=await api('/api/images/jobs/'+state.job);$('#job-stage').textContent=job.stage;$('#progress').max=job.total_steps||1;$('#progress').value=job.completed_steps||0;$('#elapsed').textContent=`${Math.floor(Date.now()/1000-job.created_at)} seconds elapsed`;
+function finitePositive(value){return Number.isFinite(Number(value))&&Number(value)>0;}
+function progressStageIsIndeterminate(stage){return /\b(load\w*|upload\w*|encod\w*|prepar\w*|queue\w*|wait\w*|decod\w*|sav\w*|output\w*|start\w*|making room|prompt ready)\b/i.test(String(stage||''));}
+function progressDetails(job){
+  const stage=String(job.stage||'');
+  const stageImage=stage.match(/image\s+(\d+)\s+of\s+(\d+)/i);
+  const stageSampling=stage.match(/(?:sampling|step)\s+(\d+)\s*(?:\/|of)\s*(\d+)/i);
+  const image=finitePositive(job.sampling_image)?Number(job.sampling_image):stageImage?Number(stageImage[1]):null;
+  const images=finitePositive(job.sampling_images)?Number(job.sampling_images):stageImage?Number(stageImage[2]):null;
+  const step=Number.isFinite(Number(job.sampling_step))?Number(job.sampling_step):stageSampling?Number(stageSampling[1]):null;
+  const steps=finitePositive(job.sampling_steps)?Number(job.sampling_steps):stageSampling?Number(stageSampling[2]):null;
+  const total=finitePositive(job.total_steps)?Number(job.total_steps):image&&images&&steps?images*steps:null;
+  const completed=Number.isFinite(Number(job.completed_steps))?Number(job.completed_steps):image&&steps&&step?((image-1)*steps+step):null;
+  return {stage,image,images,step,steps,total,completed};
+}
+function updateJobProgress(job){
+  const progress=$('#progress'), stage=$('#job-stage');
+  const fill=$('#progress-fill'), detail=$('#progress-detail'), percent=$('#progress-percent');
+  const terminal=job.status==='done'||job.status==='error'||job.status==='cancelled';
+  progress.dataset.state=job.status==='done'?'done':job.status==='error'||job.status==='cancelled'?'stopped':'active';
+  const details=progressDetails(job);
+  const nativeFallback=job.progress_determinate===undefined&&details.completed>0&&!progressStageIsIndeterminate(details.stage)&&!terminal;
+  let determinate=job.progress_determinate===true||nativeFallback;
+  if(job.status==='done'){
+    const max=details.total||1;progress.max=max;progress.value=max;progress.setAttribute('aria-valuenow',String(max));progress.setAttribute('aria-label','Complete');progress.setAttribute('aria-valuetext','Complete');
+    fill.style.width='100%';detail.textContent='Complete';percent.textContent='100%';
+    return;
+  }
+  if(job.status==='error'||job.status==='cancelled'){
+    stage.textContent=details.stage||'Render stopped';progress.max=details.total||1;progress.removeAttribute('value');progress.removeAttribute('aria-valuenow');progress.setAttribute('aria-label',details.stage||'Render stopped');progress.setAttribute('aria-valuetext',details.stage||'Render stopped');
+    fill.style.width='0%';detail.textContent=job.status==='cancelled'?'Cancelled':'Render stopped';percent.textContent='';
+    return;
+  }
+  if(!determinate||!finitePositive(details.total)||!Number.isFinite(details.completed)){
+    stage.textContent=details.stage||'Render in progress';progress.max=details.total||1;progress.removeAttribute('value');progress.removeAttribute('aria-valuenow');progress.setAttribute('aria-label',details.stage||'Render in progress');progress.setAttribute('aria-valuetext',details.stage||'Render in progress');
+    fill.style.width='0%';detail.textContent=job.status==='cancelling'?'Waiting for the render engine to stop':'Waiting for progress';percent.textContent='';
+    return;
+  }
+  const completed=Math.min(Math.max(details.completed,0),details.total);progress.max=details.total;progress.value=completed;
+  const samplingPercent=Math.round(completed/details.total*100);
+  const samplingLabel=details.steps&&Number.isFinite(details.step)?`Sampling ${details.step} / ${details.steps} steps`:details.stage||stage.textContent||'Sampling';
+  const imageLabel=details.image&&details.images?`Image ${details.image} of ${details.images} · `:'';
+  const label=`${imageLabel}${samplingLabel} · ${samplingPercent}%`;
+  stage.textContent='Sampling';detail.textContent=imageLabel+samplingLabel;percent.textContent=`${samplingPercent}%`;fill.style.width=`${completed/details.total*100}%`;
+  progress.setAttribute('aria-label',label);progress.setAttribute('aria-valuenow',String(completed));progress.setAttribute('aria-valuetext',label);
+}
+async function watchJob(){if(!state.job)return;$('#status-panel').hidden=false;try{const job=await api('/api/images/jobs/'+state.job);$('#job-stage').textContent=job.stage;updateJobProgress(job);$('#elapsed').textContent=`${Math.floor(Date.now()/1000-job.created_at)} seconds elapsed`;
 if(['done','error','cancelled'].includes(job.status)){state.job=null;localStorage.removeItem('frosty.imageJob');$('#spinner').hidden=true;$('#cancel').hidden=true;$('#generate').disabled=!state.ready;if(job.outputs?.length){$('#results').replaceChildren();job.outputs.forEach(o=>resultCard(o,$('#results')));}if(job.status==='error'){formError(job.error);$('#job-stage').textContent='Render stopped';}if(job.status==='done'){$('#elapsed').textContent=`Completed in ${job.seconds}s`;if(job.enhancement)showEnhancement(job.enhancement,job.kind==='image');}$('#enhance').disabled=!state.ready||!state.enhancementReady;await loadGallery();return;}$('#spinner').hidden=false;$('#cancel').hidden=false;setTimeout(watchJob,1500);}catch(error){formError(error.message);if(error.message==='Unknown image job'){state.job=null;localStorage.removeItem('frosty.imageJob');$('#generate').disabled=!state.ready;}else setTimeout(watchJob,5000);}}
 $('#cancel').onclick=async()=>{if(!state.job)return;try{await api('/api/images/jobs/'+state.job+'/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});$('#job-stage').textContent='Cancelling after the current operation';}catch(error){formError(error.message);}};
 async function loadGallery(){
